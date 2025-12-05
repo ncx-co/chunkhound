@@ -14,7 +14,7 @@ def test_tool_registry_populated():
     assert len(TOOL_REGISTRY) > 0, "TOOL_REGISTRY should contain tools"
 
     # Check expected tools are present
-    expected_tools = ["get_stats", "health_check", "search_regex", "search_semantic", "code_research"]
+    expected_tools = ["get_stats", "health_check", "search_regex", "search_semantic", "code_research", "list_worktrees"]
     for tool_name in expected_tools:
         assert tool_name in TOOL_REGISTRY, f"Tool '{tool_name}' should be in registry"
 
