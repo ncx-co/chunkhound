@@ -1843,12 +1843,19 @@ class DuckDBProvider(SerialDatabaseProvider):
         offset: int = 0,
         threshold: float | None = None,
         path_filter: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Perform semantic vector search using HNSW index with multi-dimension support.
 
         # PERFORMANCE: HNSW index provides ~5ms query time
         # ACCURACY: Cosine similarity metric
         # OPTIMIZATION: Dimension-specific tables (1536D, 3072D, etc.)
+
+        Args:
+            worktree_ids: Optional list of worktree IDs to limit search scope.
+                If None, searches all indexed files (no filtering).
+                Pass ["all"] to explicitly search all worktrees.
+                Pass specific IDs to search only those worktrees (including inherited files).
         """
         return self._execute_in_db_thread_sync(
             "search_semantic",
@@ -1859,6 +1866,7 @@ class DuckDBProvider(SerialDatabaseProvider):
             offset,
             threshold,
             path_filter,
+            worktree_ids,
         )
 
     def _executor_search_semantic(
@@ -1872,6 +1880,7 @@ class DuckDBProvider(SerialDatabaseProvider):
         offset: int,
         threshold: float | None,
         path_filter: str | None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Executor method for search_semantic - runs in DB thread."""
         try:
@@ -1912,7 +1921,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                 WHERE e.provider = ? AND e.model = ?
             """
 
-            params = [query_embedding, provider, model]
+            params: list[Any] = [query_embedding, provider, model]
 
             if threshold is not None:
                 query += f" AND array_cosine_similarity(e.embedding, ?::FLOAT[{query_dims}]) >= ?"
@@ -1925,6 +1934,25 @@ class DuckDBProvider(SerialDatabaseProvider):
                 # even when the database base_directory is higher (e.g., monorepo root).
                 params.append(f"%{normalized_path}%")
 
+            # Worktree filtering: include files owned by or inherited by specified worktrees
+            if worktree_ids is not None and worktree_ids != ["all"]:
+                # Build worktree filter with inheritance support
+                # A file matches if:
+                # 1. It's directly owned by one of the worktrees (f.worktree_id IN (...))
+                # 2. It's inherited by one of the worktrees (via file_worktree_inheritance)
+                placeholders = ", ".join(["?" for _ in worktree_ids])
+                query += f"""
+                    AND (
+                        f.worktree_id IN ({placeholders})
+                        OR f.id IN (
+                            SELECT fwi.file_id FROM file_worktree_inheritance fwi
+                            WHERE fwi.worktree_id IN ({placeholders})
+                        )
+                    )
+                """
+                params.extend(worktree_ids)  # For first IN clause
+                params.extend(worktree_ids)  # For second IN clause in subquery
+
             # Get total count for pagination
             # Build count query separately to avoid string replacement issues
             count_query = f"""
@@ -1935,7 +1963,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                 WHERE e.provider = ? AND e.model = ?
             """
 
-            count_params = [provider, model]
+            count_params: list[Any] = [provider, model]
 
             if threshold is not None:
                 count_query += f" AND array_cosine_similarity(e.embedding, ?::FLOAT[{query_dims}]) >= ?"
@@ -1945,6 +1973,21 @@ class DuckDBProvider(SerialDatabaseProvider):
                 count_query += " AND f.path LIKE ?"
                 # Substring match for consistency with main query
                 count_params.append(f"%{normalized_path}%")
+
+            # Add worktree filter to count query as well
+            if worktree_ids is not None and worktree_ids != ["all"]:
+                placeholders = ", ".join(["?" for _ in worktree_ids])
+                count_query += f"""
+                    AND (
+                        f.worktree_id IN ({placeholders})
+                        OR f.id IN (
+                            SELECT fwi.file_id FROM file_worktree_inheritance fwi
+                            WHERE fwi.worktree_id IN ({placeholders})
+                        )
+                    )
+                """
+                count_params.extend(worktree_ids)
+                count_params.extend(worktree_ids)
 
             total_count = conn.execute(count_query, count_params).fetchone()[0]
 
@@ -1995,10 +2038,18 @@ class DuckDBProvider(SerialDatabaseProvider):
         page_size: int = 10,
         offset: int = 0,
         path_filter: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Perform regex search on code content."""
+        """Perform regex search on code content.
+
+        Args:
+            worktree_ids: Optional list of worktree IDs to limit search scope.
+                If None, searches all indexed files (no filtering).
+                Pass ["all"] to explicitly search all worktrees.
+                Pass specific IDs to search only those worktrees (including inherited files).
+        """
         return self._execute_in_db_thread_sync(
-            "search_regex", pattern, page_size, offset, path_filter
+            "search_regex", pattern, page_size, offset, path_filter, worktree_ids
         )
 
     def search_chunks_regex(
@@ -2020,6 +2071,7 @@ class DuckDBProvider(SerialDatabaseProvider):
         page_size: int,
         offset: int,
         path_filter: str | None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Executor method for search_regex - runs in DB thread."""
         try:
@@ -2028,12 +2080,28 @@ class DuckDBProvider(SerialDatabaseProvider):
 
             # Build base WHERE clause
             where_conditions = ["regexp_matches(c.code, ?)"]
-            params = [pattern]
+            params: list[Any] = [pattern]
 
             if normalized_path is not None:
                 where_conditions.append("f.path LIKE ?")
                 # Allow matching repo-relative segments inside stored paths
                 params.append(f"%{normalized_path}%")
+
+            # Worktree filtering: include files owned by or inherited by specified worktrees
+            if worktree_ids is not None and worktree_ids != ["all"]:
+                placeholders = ", ".join(["?" for _ in worktree_ids])
+                worktree_condition = f"""
+                    (
+                        f.worktree_id IN ({placeholders})
+                        OR f.id IN (
+                            SELECT fwi.file_id FROM file_worktree_inheritance fwi
+                            WHERE fwi.worktree_id IN ({placeholders})
+                        )
+                    )
+                """
+                where_conditions.append(worktree_condition)
+                params.extend(worktree_ids)  # For first IN clause
+                params.extend(worktree_ids)  # For second IN clause in subquery
 
             where_clause = " AND ".join(where_conditions)
 

@@ -51,6 +51,8 @@ from chunkhound.utils.file_patterns import (
 from chunkhound.utils.worktree_detection import (
     detect_worktree_info,
     compute_worktree_id,
+    compute_changed_files_via_git,
+    fallback_compute_changed_files,
     get_git_head_ref,
     WorktreeInfo,
 )
@@ -268,6 +270,106 @@ class IndexingCoordinator(BaseService):
                 logger.debug(f"Updated worktree indexed_at: {worktree_id[:8]}")
         except Exception as e:
             logger.warning(f"Failed to update worktree indexed_at: {e}")
+
+    async def _create_inheritance_records(
+        self,
+        worktree_info: WorktreeInfo,
+        unchanged_files: list[Path],
+        head_ref: str | None = None,
+    ) -> int:
+        """Create file inheritance records for unchanged files in a linked worktree.
+
+        For delta indexing, unchanged files inherit their chunks from the main worktree
+        instead of being re-indexed. This method creates the inheritance records that
+        track which files are inherited and from which source.
+
+        Args:
+            worktree_info: Info about the current (linked) worktree
+            unchanged_files: List of file paths that are unchanged from main worktree
+            head_ref: Current HEAD ref of the main worktree (for staleness tracking)
+
+        Returns:
+            Number of inheritance records created
+        """
+        if not unchanged_files:
+            return 0
+
+        if not worktree_info.main_worktree_path:
+            logger.warning("Cannot create inheritance: no main worktree path")
+            return 0
+
+        main_worktree_id = compute_worktree_id(worktree_info.main_worktree_path)
+        feature_worktree_id = worktree_info.worktree_id
+
+        # Get main worktree's HEAD for staleness tracking
+        main_head_ref = head_ref or get_git_head_ref(worktree_info.main_worktree_path)
+
+        # Build batch of inheritance records
+        inheritances: list[dict[str, Any]] = []
+
+        # The feature worktree directory is where the unchanged files are located
+        # We need to get the relative path within the worktree, then look up the
+        # corresponding file in the main worktree's database
+        feature_worktree_root = self._base_directory.resolve()
+
+        for file_path in unchanged_files:
+            try:
+                # The unchanged files are absolute paths in the feature worktree
+                # Get the relative path within the worktree
+                try:
+                    rel_path = file_path.resolve().relative_to(feature_worktree_root)
+                    rel_path_str = rel_path.as_posix()
+                except ValueError:
+                    # If file is outside the base directory, skip it
+                    logger.debug(f"File {file_path} is outside base directory, skipping")
+                    continue
+
+                # Get the file record from main worktree
+                # The database stores paths relative to the indexed directory
+                file_record = None
+                try:
+                    file_record = self._db.get_file_by_path(rel_path_str, as_model=False)
+                except Exception as e:
+                    logger.debug(f"Could not find main worktree file {rel_path_str}: {e}")
+
+                if file_record and file_record.get("id"):
+                    inheritances.append({
+                        "worktree_id": feature_worktree_id,
+                        "file_id": file_record["id"],
+                        "source_worktree_id": main_worktree_id,
+                        "source_head_ref": main_head_ref,
+                    })
+            except Exception as e:
+                logger.debug(f"Skipping inheritance for {file_path}: {e}")
+                continue
+
+        # Batch insert inheritance records
+        if inheritances and hasattr(self._db, 'create_file_inheritances_batch'):
+            try:
+                created = self._db.create_file_inheritances_batch(inheritances)
+                logger.debug(
+                    f"Created {created} inheritance records for worktree {feature_worktree_id[:8]}"
+                )
+                return created
+            except Exception as e:
+                logger.warning(f"Failed to create inheritance records in batch: {e}")
+                # Fall back to individual inserts
+                created = 0
+                for inheritance in inheritances:
+                    try:
+                        if hasattr(self._db, 'create_file_inheritance'):
+                            self._db.create_file_inheritance(
+                                worktree_id=inheritance["worktree_id"],
+                                file_id=inheritance["file_id"],
+                                source_worktree_id=inheritance["source_worktree_id"],
+                                source_head_ref=inheritance["source_head_ref"],
+                            )
+                            created += 1
+                    except Exception as inner_e:
+                        logger.debug(f"Failed to create individual inheritance: {inner_e}")
+                return created
+
+        return 0
 
     def add_language_parser(self, language: Language, parser: UniversalParser) -> None:
         """Add or update a language parser.
@@ -1128,9 +1230,73 @@ class IndexingCoordinator(BaseService):
                 f"(id: {worktree_info.worktree_id[:8]})"
             )
 
+            # Phase 0.5: Delta Indexing Check - Use delta indexing for linked worktrees
+            # when main worktree is already indexed
+            delta_mode = False
+            delta_files: dict[str, list[Path]] | None = None
+
+            if worktree_info.is_linked and self._check_main_worktree_indexed(worktree_info):
+                logger.info(
+                    f"Delta indexing: linked worktree detected, main worktree is indexed"
+                )
+                try:
+                    main_worktree_path = worktree_info.main_worktree_path
+                    if main_worktree_path:
+                        # Compute file changes between main and feature worktree
+                        delta_files = compute_changed_files_via_git(
+                            main_worktree=main_worktree_path,
+                            feature_worktree=directory,
+                            patterns=patterns or [],
+                            exclude_patterns=exclude_patterns or [],
+                        )
+                        delta_mode = True
+                        logger.info(
+                            f"Delta analysis: +{len(delta_files['added'])} added, "
+                            f"~{len(delta_files['modified'])} modified, "
+                            f"-{len(delta_files['deleted'])} deleted, "
+                            f"={len(delta_files['unchanged'])} unchanged"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Delta indexing failed, falling back to full indexing: {e}"
+                    )
+                    delta_mode = False
+                    delta_files = None
+
             # Phase 1: Discovery - Discover files in directory (now parallelized)
-            files = await self._discover_files(directory, patterns, exclude_patterns)
+            # For delta mode, use computed changed files instead of full discovery
+            if delta_mode and delta_files is not None:
+                # Only process added + modified files
+                files = delta_files["added"] + delta_files["modified"]
+                logger.debug(
+                    f"Delta mode: processing {len(files)} changed files "
+                    f"(skipping {len(delta_files['unchanged'])} unchanged)"
+                )
+            else:
+                files = await self._discover_files(directory, patterns, exclude_patterns)
             _t1 = _t.perf_counter() if _t0 is not None else None
+
+            # Handle delta mode with no changed files but unchanged files to inherit
+            if not files and delta_mode and delta_files is not None:
+                # Create inheritance records for unchanged files even if no changes
+                inherited_count = await self._create_inheritance_records(
+                    worktree_info=worktree_info,
+                    unchanged_files=delta_files["unchanged"],
+                    head_ref=head_ref,
+                )
+                # Update worktree indexed_at timestamp
+                self._update_worktree_indexed_at(worktree_info.worktree_id, head_ref)
+                logger.info(
+                    f"Delta indexing complete: no changed files, "
+                    f"{inherited_count} files inherited from main worktree"
+                )
+                return {
+                    "status": "delta_no_changes",
+                    "files_processed": 0,
+                    "total_chunks": 0,
+                    "inherited_files": inherited_count,
+                    "delta_mode": True,
+                }
 
             if not files:
                 return {"status": "no_files", "files_processed": 0, "total_chunks": 0}
@@ -1495,11 +1661,23 @@ class IndexingCoordinator(BaseService):
                         "error": error["error"],
                     }
 
+            # Phase 6: Delta Inheritance - Create inheritance records for unchanged files
+            inherited_count = 0
+            if delta_mode and delta_files is not None and worktree_info:
+                inherited_count = await self._create_inheritance_records(
+                    worktree_info=worktree_info,
+                    unchanged_files=delta_files["unchanged"],
+                    head_ref=head_ref,
+                )
+                logger.info(
+                    f"Delta indexing: {inherited_count} files inherited from main worktree"
+                )
+
             # Update worktree indexed_at timestamp on successful indexing
             if self._current_worktree_id:
                 self._update_worktree_indexed_at(self._current_worktree_id, head_ref)
 
-            return {
+            result = {
                 "status": "success",
                 "files_processed": total_files,
                 "total_chunks": total_chunks,
@@ -1509,6 +1687,13 @@ class IndexingCoordinator(BaseService):
                 "skipped_filtered": skipped_filtered,
                 "worktree_id": self._current_worktree_id,
             }
+
+            # Add delta-specific stats if applicable
+            if delta_mode:
+                result["delta_mode"] = True
+                result["inherited_files"] = inherited_count
+
+            return result
 
 
 

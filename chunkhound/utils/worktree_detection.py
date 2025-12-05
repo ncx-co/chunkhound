@@ -234,7 +234,7 @@ def compute_changed_files_via_git(
 
     # Compute unchanged files
     # All files in feature worktree that weren't marked as added/modified
-    from chunkhound.utils.file_discovery import discover_files
+    from chunkhound.utils.file_patterns import discover_files
 
     all_feature_files = discover_files(
         feature_worktree,
@@ -294,7 +294,7 @@ def fallback_compute_changed_files(
         ... )
     """
     from chunkhound.utils.hashing import compute_file_hash
-    from chunkhound.utils.file_discovery import discover_files
+    from chunkhound.utils.file_patterns import discover_files
 
     logger.info(
         f"Using hash-based change detection (Git fallback) for {feature_worktree.name}"

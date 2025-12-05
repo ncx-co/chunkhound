@@ -687,3 +687,36 @@ def walk_subtree_worker(
         )
         errors.append(error_msg)
         return [], errors
+
+
+def discover_files(
+    directory: Path,
+    patterns: list[str],
+    exclude_patterns: list[str],
+) -> list[Path]:
+    """Simple file discovery wrapper for use by worktree delta detection.
+
+    This provides a synchronous interface to the existing walk_directory_tree
+    function for use in contexts where async is not needed.
+
+    Args:
+        directory: Directory to search
+        patterns: File patterns to include (e.g., ["*.py", "*.ts"])
+        exclude_patterns: Patterns to exclude
+
+    Returns:
+        List of file paths matching the patterns
+    """
+    # Initialize parent gitignores with root directory
+    parent_gitignores: dict[Path, list[str]] = {}
+    parent_gitignores[directory] = load_gitignore_patterns(directory, directory)
+
+    files, _ = walk_directory_tree(
+        start_path=directory,
+        root_directory=directory,
+        patterns=patterns,
+        exclude_patterns=exclude_patterns,
+        parent_gitignores=parent_gitignores,
+        use_inode_ordering=False,
+    )
+    return files
