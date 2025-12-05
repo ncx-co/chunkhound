@@ -166,11 +166,12 @@ async def test_search_strategy_selection_verification(simple_test_database):
                 page_size=5,
                 offset=0,
                 threshold=None,
-                provider="mock_voyage", 
+                provider="mock_voyage",
                 model="mock-model",
-                path_filter=None
+                path_filter=None,
+                worktree_ids=None,
             )
-            
+
             # OpenAI provider should use standard search
             await openai_search.search_semantic(query, page_size=5)
             mock_standard.assert_called_once_with(
@@ -179,8 +180,9 @@ async def test_search_strategy_selection_verification(simple_test_database):
                 offset=0,
                 threshold=None,
                 provider="mock_openai",
-                model="mock-model", 
-                path_filter=None
+                model="mock-model",
+                path_filter=None,
+                worktree_ids=None,
             )
 
 

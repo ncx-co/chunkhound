@@ -426,13 +426,14 @@ class DuckDBProvider(SerialDatabaseProvider):
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS files (
                     id INTEGER PRIMARY KEY DEFAULT nextval('files_id_seq'),
-                    path TEXT UNIQUE NOT NULL,
+                    path TEXT NOT NULL,
                     name TEXT NOT NULL,
                     extension TEXT,
                     size INTEGER,
                     modified_time TIMESTAMP,
                     content_hash TEXT,
                     language TEXT,
+                    worktree_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -441,6 +442,11 @@ class DuckDBProvider(SerialDatabaseProvider):
             # Ensure content_hash exists for existing DBs
             conn.execute(
                 "ALTER TABLE files ADD COLUMN IF NOT EXISTS content_hash TEXT"
+            )
+
+            # Ensure worktree_id exists for existing DBs
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN IF NOT EXISTS worktree_id TEXT"
             )
 
             # Create sequence for chunks table
@@ -498,6 +504,32 @@ class DuckDBProvider(SerialDatabaseProvider):
             # Create index on chunk_id for efficient deletions
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_embeddings_1536_chunk_id ON embeddings_1536(chunk_id)
+            """)
+
+            # Worktrees table - tracks git worktree metadata
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS worktrees (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    is_main BOOLEAN NOT NULL,
+                    main_worktree_id TEXT,
+                    head_ref TEXT,
+                    indexed_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # File worktree inheritance - tracks files inherited from main worktree
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS file_worktree_inheritance (
+                    worktree_id TEXT NOT NULL,
+                    file_id INTEGER NOT NULL,
+                    source_worktree_id TEXT NOT NULL,
+                    source_head_ref TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (worktree_id, file_id)
+                )
             """)
 
             # Handle schema migrations for existing databases
@@ -602,6 +634,17 @@ class DuckDBProvider(SerialDatabaseProvider):
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_files_language ON files(language)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_worktree_id ON files(worktree_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)"
+            )
+            # Compound index for worktree-scoped path lookups
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_worktree_path "
+                "ON files(worktree_id, path)"
+            )
 
             # Chunk indexes
             conn.execute(
@@ -612,6 +655,28 @@ class DuckDBProvider(SerialDatabaseProvider):
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol)"
+            )
+
+            # Worktree indexes
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worktrees_main ON worktrees(main_worktree_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worktrees_path ON worktrees(path)"
+            )
+
+            # File inheritance indexes
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_inheritance_worktree "
+                "ON file_worktree_inheritance(worktree_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_inheritance_file "
+                "ON file_worktree_inheritance(file_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_inheritance_source "
+                "ON file_worktree_inheritance(source_worktree_id)"
             )
 
             # Embedding indexes are created per-table in _executor_ensure_embedding_table_exists()
@@ -2584,3 +2649,499 @@ class DuckDBProvider(SerialDatabaseProvider):
                 )
         except Exception:
             pass
+
+    # =========================================================================
+    # Worktree Operations
+    # =========================================================================
+
+    def upsert_worktree(
+        self,
+        worktree_id: str,
+        path: str,
+        is_main: bool,
+        main_worktree_id: str | None = None,
+        head_ref: str | None = None,
+    ) -> None:
+        """Insert or update a worktree record."""
+        self._execute_in_db_thread_sync(
+            "upsert_worktree", worktree_id, path, is_main, main_worktree_id, head_ref
+        )
+
+    def _executor_upsert_worktree(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        worktree_id: str,
+        path: str,
+        is_main: bool,
+        main_worktree_id: str | None,
+        head_ref: str | None,
+    ) -> None:
+        """Executor method for upsert_worktree - runs in DB thread."""
+        track_operation(state)
+
+        # Check if worktree exists
+        existing = conn.execute(
+            "SELECT id FROM worktrees WHERE id = ?", [worktree_id]
+        ).fetchone()
+
+        if existing:
+            # Update existing worktree
+            conn.execute(
+                """
+                UPDATE worktrees SET
+                    path = ?,
+                    is_main = ?,
+                    main_worktree_id = ?,
+                    head_ref = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [path, is_main, main_worktree_id, head_ref, worktree_id],
+            )
+        else:
+            # Insert new worktree
+            conn.execute(
+                """
+                INSERT INTO worktrees (id, path, is_main, main_worktree_id, head_ref)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [worktree_id, path, is_main, main_worktree_id, head_ref],
+            )
+
+    def get_worktree(self, worktree_id: str) -> dict[str, Any] | None:
+        """Get worktree by ID."""
+        return self._execute_in_db_thread_sync("get_worktree", worktree_id)
+
+    def _executor_get_worktree(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> dict[str, Any] | None:
+        """Executor method for get_worktree - runs in DB thread."""
+        result = conn.execute(
+            """
+            SELECT id, path, is_main, main_worktree_id, head_ref, indexed_at,
+                   created_at, updated_at
+            FROM worktrees WHERE id = ?
+            """,
+            [worktree_id],
+        ).fetchone()
+
+        if not result:
+            return None
+
+        return {
+            "id": result[0],
+            "path": result[1],
+            "is_main": result[2],
+            "main_worktree_id": result[3],
+            "head_ref": result[4],
+            "indexed_at": result[5],
+            "created_at": result[6],
+            "updated_at": result[7],
+        }
+
+    def get_worktree_by_path(self, path: str) -> dict[str, Any] | None:
+        """Get worktree by path."""
+        return self._execute_in_db_thread_sync("get_worktree_by_path", path)
+
+    def _executor_get_worktree_by_path(
+        self, conn: Any, state: dict[str, Any], path: str
+    ) -> dict[str, Any] | None:
+        """Executor method for get_worktree_by_path - runs in DB thread."""
+        result = conn.execute(
+            """
+            SELECT id, path, is_main, main_worktree_id, head_ref, indexed_at,
+                   created_at, updated_at
+            FROM worktrees WHERE path = ?
+            """,
+            [path],
+        ).fetchone()
+
+        if not result:
+            return None
+
+        return {
+            "id": result[0],
+            "path": result[1],
+            "is_main": result[2],
+            "main_worktree_id": result[3],
+            "head_ref": result[4],
+            "indexed_at": result[5],
+            "created_at": result[6],
+            "updated_at": result[7],
+        }
+
+    def list_worktrees(self) -> list[dict[str, Any]]:
+        """List all registered worktrees."""
+        return self._execute_in_db_thread_sync("list_worktrees")
+
+    def _executor_list_worktrees(
+        self, conn: Any, state: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Executor method for list_worktrees - runs in DB thread."""
+        results = conn.execute(
+            """
+            SELECT id, path, is_main, main_worktree_id, head_ref, indexed_at,
+                   created_at, updated_at
+            FROM worktrees
+            ORDER BY is_main DESC, path ASC
+            """
+        ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "path": row[1],
+                "is_main": row[2],
+                "main_worktree_id": row[3],
+                "head_ref": row[4],
+                "indexed_at": row[5],
+                "created_at": row[6],
+                "updated_at": row[7],
+            }
+            for row in results
+        ]
+
+    def update_worktree_indexed_at(
+        self, worktree_id: str, head_ref: str | None = None
+    ) -> None:
+        """Update the indexed_at timestamp and optionally head_ref for a worktree."""
+        self._execute_in_db_thread_sync(
+            "update_worktree_indexed_at", worktree_id, head_ref
+        )
+
+    def _executor_update_worktree_indexed_at(
+        self, conn: Any, state: dict[str, Any], worktree_id: str, head_ref: str | None
+    ) -> None:
+        """Executor method for update_worktree_indexed_at - runs in DB thread."""
+        track_operation(state)
+
+        if head_ref is not None:
+            conn.execute(
+                """
+                UPDATE worktrees SET
+                    indexed_at = CURRENT_TIMESTAMP,
+                    head_ref = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [head_ref, worktree_id],
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE worktrees SET
+                    indexed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [worktree_id],
+            )
+
+    def delete_worktree(self, worktree_id: str) -> bool:
+        """Delete a worktree and all associated data."""
+        return self._execute_in_db_thread_sync("delete_worktree", worktree_id)
+
+    def _executor_delete_worktree(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> bool:
+        """Executor method for delete_worktree - runs in DB thread."""
+        track_operation(state)
+
+        # Check if worktree exists
+        existing = conn.execute(
+            "SELECT id FROM worktrees WHERE id = ?", [worktree_id]
+        ).fetchone()
+
+        if not existing:
+            return False
+
+        # Delete in correct order due to foreign key constraints
+        # 1. Delete file inheritance records
+        conn.execute(
+            "DELETE FROM file_worktree_inheritance WHERE worktree_id = ?",
+            [worktree_id],
+        )
+        conn.execute(
+            "DELETE FROM file_worktree_inheritance WHERE source_worktree_id = ?",
+            [worktree_id],
+        )
+
+        # 2. Get all files for this worktree
+        file_ids = conn.execute(
+            "SELECT id FROM files WHERE worktree_id = ?", [worktree_id]
+        ).fetchall()
+
+        # 3. Delete embeddings for these files
+        if file_ids:
+            file_id_list = [f[0] for f in file_ids]
+            embedding_tables = self._executor_get_all_embedding_tables(conn, state)
+            for table_name in embedding_tables:
+                placeholders = ",".join(["?" for _ in file_id_list])
+                conn.execute(
+                    f"""
+                    DELETE FROM {table_name}
+                    WHERE chunk_id IN (
+                        SELECT id FROM chunks WHERE file_id IN ({placeholders})
+                    )
+                    """,
+                    file_id_list,
+                )
+
+            # 4. Delete chunks
+            placeholders = ",".join(["?" for _ in file_id_list])
+            conn.execute(
+                f"DELETE FROM chunks WHERE file_id IN ({placeholders})", file_id_list
+            )
+
+            # 5. Delete files
+            conn.execute(
+                f"DELETE FROM files WHERE id IN ({placeholders})", file_id_list
+            )
+
+        # 6. Delete worktree record
+        conn.execute("DELETE FROM worktrees WHERE id = ?", [worktree_id])
+
+        logger.debug(f"Worktree {worktree_id} and all associated data deleted")
+        return True
+
+    # =========================================================================
+    # File Worktree Inheritance Operations
+    # =========================================================================
+
+    def create_file_inheritance(
+        self,
+        worktree_id: str,
+        file_id: int,
+        source_worktree_id: str,
+        source_head_ref: str | None = None,
+    ) -> None:
+        """Create a file inheritance record (file inherited from another worktree)."""
+        self._execute_in_db_thread_sync(
+            "create_file_inheritance",
+            worktree_id,
+            file_id,
+            source_worktree_id,
+            source_head_ref,
+        )
+
+    def _executor_create_file_inheritance(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        worktree_id: str,
+        file_id: int,
+        source_worktree_id: str,
+        source_head_ref: str | None,
+    ) -> None:
+        """Executor method for create_file_inheritance - runs in DB thread."""
+        track_operation(state)
+
+        # Use INSERT OR REPLACE for idempotency
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO file_worktree_inheritance
+            (worktree_id, file_id, source_worktree_id, source_head_ref)
+            VALUES (?, ?, ?, ?)
+            """,
+            [worktree_id, file_id, source_worktree_id, source_head_ref],
+        )
+
+    def create_file_inheritances_batch(
+        self,
+        inheritances: list[dict[str, Any]],
+    ) -> int:
+        """Create multiple file inheritance records in batch.
+
+        Args:
+            inheritances: List of dicts with keys:
+                - worktree_id: str
+                - file_id: int
+                - source_worktree_id: str
+                - source_head_ref: str | None
+
+        Returns:
+            Number of records inserted
+        """
+        return self._execute_in_db_thread_sync(
+            "create_file_inheritances_batch", inheritances
+        )
+
+    def _executor_create_file_inheritances_batch(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        inheritances: list[dict[str, Any]],
+    ) -> int:
+        """Executor method for create_file_inheritances_batch - runs in DB thread."""
+        if not inheritances:
+            return 0
+
+        track_operation(state)
+
+        # Prepare batch data
+        data = [
+            (
+                inh["worktree_id"],
+                inh["file_id"],
+                inh["source_worktree_id"],
+                inh.get("source_head_ref"),
+            )
+            for inh in inheritances
+        ]
+
+        # Use executemany for batch insert
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO file_worktree_inheritance
+            (worktree_id, file_id, source_worktree_id, source_head_ref)
+            VALUES (?, ?, ?, ?)
+            """,
+            data,
+        )
+
+        return len(data)
+
+    def get_inherited_files(
+        self, worktree_id: str
+    ) -> list[dict[str, Any]]:
+        """Get all files inherited by a worktree."""
+        return self._execute_in_db_thread_sync("get_inherited_files", worktree_id)
+
+    def _executor_get_inherited_files(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> list[dict[str, Any]]:
+        """Executor method for get_inherited_files - runs in DB thread."""
+        results = conn.execute(
+            """
+            SELECT fwi.file_id, fwi.source_worktree_id, fwi.source_head_ref,
+                   f.path, f.content_hash
+            FROM file_worktree_inheritance fwi
+            JOIN files f ON f.id = fwi.file_id
+            WHERE fwi.worktree_id = ?
+            """,
+            [worktree_id],
+        ).fetchall()
+
+        return [
+            {
+                "file_id": row[0],
+                "source_worktree_id": row[1],
+                "source_head_ref": row[2],
+                "path": row[3],
+                "content_hash": row[4],
+            }
+            for row in results
+        ]
+
+    def delete_file_inheritance(self, worktree_id: str, file_id: int) -> bool:
+        """Delete a specific file inheritance record."""
+        return self._execute_in_db_thread_sync(
+            "delete_file_inheritance", worktree_id, file_id
+        )
+
+    def _executor_delete_file_inheritance(
+        self, conn: Any, state: dict[str, Any], worktree_id: str, file_id: int
+    ) -> bool:
+        """Executor method for delete_file_inheritance - runs in DB thread."""
+        track_operation(state)
+
+        result = conn.execute(
+            """
+            DELETE FROM file_worktree_inheritance
+            WHERE worktree_id = ? AND file_id = ?
+            """,
+            [worktree_id, file_id],
+        )
+
+        return result.rowcount > 0
+
+    def clear_worktree_inheritances(self, worktree_id: str) -> int:
+        """Clear all inheritance records for a worktree."""
+        return self._execute_in_db_thread_sync(
+            "clear_worktree_inheritances", worktree_id
+        )
+
+    def _executor_clear_worktree_inheritances(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> int:
+        """Executor method for clear_worktree_inheritances - runs in DB thread."""
+        track_operation(state)
+
+        result = conn.execute(
+            "DELETE FROM file_worktree_inheritance WHERE worktree_id = ?",
+            [worktree_id],
+        )
+
+        return result.rowcount
+
+    def get_stale_inheritances(
+        self, worktree_id: str, current_head_ref: str
+    ) -> list[dict[str, Any]]:
+        """Get inheritance records that may be stale due to source worktree changes.
+
+        Returns inheritance records where source_head_ref doesn't match the
+        source worktree's current head_ref.
+        """
+        return self._execute_in_db_thread_sync(
+            "get_stale_inheritances", worktree_id, current_head_ref
+        )
+
+    def _executor_get_stale_inheritances(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        worktree_id: str,
+        current_head_ref: str,
+    ) -> list[dict[str, Any]]:
+        """Executor method for get_stale_inheritances - runs in DB thread."""
+        # Find inheritances where the source worktree's head has changed
+        results = conn.execute(
+            """
+            SELECT fwi.file_id, fwi.source_worktree_id, fwi.source_head_ref,
+                   w.head_ref as current_source_head_ref,
+                   f.path
+            FROM file_worktree_inheritance fwi
+            JOIN worktrees w ON w.id = fwi.source_worktree_id
+            JOIN files f ON f.id = fwi.file_id
+            WHERE fwi.worktree_id = ?
+              AND (fwi.source_head_ref IS NULL OR fwi.source_head_ref != w.head_ref)
+            """,
+            [worktree_id],
+        ).fetchall()
+
+        return [
+            {
+                "file_id": row[0],
+                "source_worktree_id": row[1],
+                "source_head_ref": row[2],
+                "current_source_head_ref": row[3],
+                "path": row[4],
+            }
+            for row in results
+        ]
+
+    def get_worktree_file_count(self, worktree_id: str) -> dict[str, int]:
+        """Get file counts for a worktree (native + inherited)."""
+        return self._execute_in_db_thread_sync("get_worktree_file_count", worktree_id)
+
+    def _executor_get_worktree_file_count(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> dict[str, int]:
+        """Executor method for get_worktree_file_count - runs in DB thread."""
+        # Count native files (directly indexed for this worktree)
+        native_count = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE worktree_id = ?", [worktree_id]
+        ).fetchone()[0]
+
+        # Count inherited files
+        inherited_count = conn.execute(
+            "SELECT COUNT(*) FROM file_worktree_inheritance WHERE worktree_id = ?",
+            [worktree_id],
+        ).fetchone()[0]
+
+        return {
+            "native": native_count,
+            "inherited": inherited_count,
+            "total": native_count + inherited_count,
+        }

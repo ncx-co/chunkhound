@@ -169,7 +169,13 @@ def unique_mcp_test_function():
             }
         )
         assert len(initial_results.get('results', [])) > 0, "Initial content should be found"
-        
+
+        # Wait for the dedup window to expire before modifying
+        # The _EVENT_DEDUP_WINDOW_SECONDS is 2.0s, measured from when the event
+        # was first consumed (which happens ~0.5s after file creation)
+        # We need to ensure our modification event arrives AFTER this window closes
+        await asyncio.sleep(2.5)
+
         # Modify file with new unique content
         test_file.write_text("""
 def initial_function(): pass
@@ -178,10 +184,10 @@ def modified_unique_regex_pattern():
     '''Added by modification - should be found by regex'''
     return "modification_success"
 """)
-        
-        # Wait for debounce + processing
+
+        # Wait for debounce + processing of the modification
         await asyncio.sleep(2.0)
-        
+
         # Search for modified content using MCP tool execution
         modified_results = await execute_tool(
             tool_name="search_regex",

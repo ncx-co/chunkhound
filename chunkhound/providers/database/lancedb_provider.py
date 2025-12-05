@@ -40,6 +40,36 @@ def get_files_schema() -> pa.Schema:
             ("language", pa.string()),
             ("encoding", pa.string()),
             ("line_count", pa.int64()),
+            ("worktree_id", pa.string()),
+        ]
+    )
+
+
+def get_worktrees_schema() -> pa.Schema:
+    """Get PyArrow schema for worktrees table."""
+    return pa.schema(
+        [
+            ("id", pa.string()),
+            ("path", pa.string()),
+            ("is_main", pa.bool_()),
+            ("main_worktree_id", pa.string()),
+            ("head_ref", pa.string()),
+            ("indexed_at", pa.float64()),
+            ("created_at", pa.float64()),
+            ("updated_at", pa.float64()),
+        ]
+    )
+
+
+def get_file_worktree_inheritance_schema() -> pa.Schema:
+    """Get PyArrow schema for file_worktree_inheritance table."""
+    return pa.schema(
+        [
+            ("worktree_id", pa.string()),
+            ("file_id", pa.int64()),
+            ("source_worktree_id", pa.string()),
+            ("source_head_ref", pa.string()),
+            ("created_at", pa.float64()),
         ]
     )
 
@@ -154,6 +184,8 @@ class LanceDBProvider(SerialDatabaseProvider):
         # Table references
         self._files_table = None
         self._chunks_table = None
+        self._worktrees_table = None
+        self._file_inheritance_table = None
 
     def _create_connection(self) -> Any:
         """Create and return a LanceDB connection.
@@ -209,6 +241,8 @@ class LanceDBProvider(SerialDatabaseProvider):
             self.connection = None
             self._files_table = None
             self._chunks_table = None
+            self._worktrees_table = None
+            self._file_inheritance_table = None
 
             # Connection will be closed by base class
             logger.info("Disconnected from LanceDB")
@@ -298,6 +332,28 @@ class LanceDBProvider(SerialDatabaseProvider):
                 "chunks", schema=get_chunks_schema(embedding_dims)
             )
             logger.info("Created chunks table")
+
+        # Create worktrees table if it doesn't exist
+        try:
+            self._worktrees_table = conn.open_table("worktrees")
+            logger.debug("Opened existing worktrees table")
+        except Exception:
+            # Table doesn't exist, create it
+            self._worktrees_table = conn.create_table(
+                "worktrees", schema=get_worktrees_schema()
+            )
+            logger.info("Created worktrees table")
+
+        # Create file_worktree_inheritance table if it doesn't exist
+        try:
+            self._file_inheritance_table = conn.open_table("file_worktree_inheritance")
+            logger.debug("Opened existing file_worktree_inheritance table")
+        except Exception:
+            # Table doesn't exist, create it
+            self._file_inheritance_table = conn.create_table(
+                "file_worktree_inheritance", schema=get_file_worktree_inheritance_schema()
+            )
+            logger.info("Created file_worktree_inheritance table")
 
     def create_indexes(self) -> None:
         """Create database indexes for performance optimization."""
@@ -645,6 +701,447 @@ class LanceDBProvider(SerialDatabaseProvider):
         except Exception as e:
             logger.error(f"Error deleting file: {e}")
             return False
+
+    # Worktree Operations
+    def upsert_worktree(
+        self,
+        worktree_id: str,
+        path: str,
+        is_main: bool,
+        main_worktree_id: str | None = None,
+        head_ref: str | None = None,
+    ) -> None:
+        """Insert or update a worktree record."""
+        return self._execute_in_db_thread_sync(
+            "upsert_worktree", worktree_id, path, is_main, main_worktree_id, head_ref
+        )
+
+    def _executor_upsert_worktree(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        worktree_id: str,
+        path: str,
+        is_main: bool,
+        main_worktree_id: str | None = None,
+        head_ref: str | None = None,
+    ) -> None:
+        """Executor method for upsert_worktree - runs in DB thread."""
+        if not self._worktrees_table:
+            self._executor_create_schema(conn, state)
+
+        now = time.time()
+        worktree_data = {
+            "id": worktree_id,
+            "path": path,
+            "is_main": is_main,
+            "main_worktree_id": main_worktree_id or "",
+            "head_ref": head_ref or "",
+            "indexed_at": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        # Use merge_insert for atomic upsert
+        worktree_table = pa.Table.from_pylist(
+            [worktree_data], schema=get_worktrees_schema()
+        )
+        (
+            self._worktrees_table.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(worktree_table)
+        )
+
+    def get_worktree(self, worktree_id: str) -> dict[str, Any] | None:
+        """Get worktree record by ID."""
+        return self._execute_in_db_thread_sync("get_worktree", worktree_id)
+
+    def _executor_get_worktree(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> dict[str, Any] | None:
+        """Executor method for get_worktree - runs in DB thread."""
+        if not self._worktrees_table:
+            return None
+
+        try:
+            results = (
+                self._worktrees_table.search()
+                .where(f"id = '{worktree_id}'")
+                .to_list()
+            )
+            if not results:
+                return None
+            return dict(results[0])
+        except Exception as e:
+            logger.error(f"Error getting worktree by ID: {e}")
+            return None
+
+    def get_worktree_by_path(self, path: str) -> dict[str, Any] | None:
+        """Get worktree record by path."""
+        return self._execute_in_db_thread_sync("get_worktree_by_path", path)
+
+    def _executor_get_worktree_by_path(
+        self, conn: Any, state: dict[str, Any], path: str
+    ) -> dict[str, Any] | None:
+        """Executor method for get_worktree_by_path - runs in DB thread."""
+        if not self._worktrees_table:
+            return None
+
+        try:
+            # Escape single quotes in path
+            escaped_path = path.replace("'", "''")
+            results = (
+                self._worktrees_table.search()
+                .where(f"path = '{escaped_path}'")
+                .to_list()
+            )
+            if not results:
+                return None
+            return dict(results[0])
+        except Exception as e:
+            logger.error(f"Error getting worktree by path: {e}")
+            return None
+
+    def list_worktrees(
+        self, main_worktree_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List all worktrees, optionally filtered by main worktree."""
+        return self._execute_in_db_thread_sync("list_worktrees", main_worktree_id)
+
+    def _executor_list_worktrees(
+        self, conn: Any, state: dict[str, Any], main_worktree_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Executor method for list_worktrees - runs in DB thread."""
+        if not self._worktrees_table:
+            return []
+
+        try:
+            if main_worktree_id:
+                # Get main worktree and all linked worktrees
+                results = (
+                    self._worktrees_table.search()
+                    .where(
+                        f"id = '{main_worktree_id}' OR "
+                        f"main_worktree_id = '{main_worktree_id}'"
+                    )
+                    .to_list()
+                )
+            else:
+                # Get all worktrees
+                count = self._worktrees_table.count_rows()
+                if count == 0:
+                    return []
+                results = self._worktrees_table.head(count).to_pandas().to_dict("records")
+
+            return [dict(r) for r in results]
+        except Exception as e:
+            logger.error(f"Error listing worktrees: {e}")
+            return []
+
+    def update_worktree_indexed_at(
+        self, worktree_id: str, head_ref: str | None = None
+    ) -> None:
+        """Update the indexed_at timestamp and optionally head_ref for a worktree."""
+        return self._execute_in_db_thread_sync(
+            "update_worktree_indexed_at", worktree_id, head_ref
+        )
+
+    def _executor_update_worktree_indexed_at(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        worktree_id: str,
+        head_ref: str | None = None,
+    ) -> None:
+        """Executor method for update_worktree_indexed_at - runs in DB thread."""
+        if not self._worktrees_table:
+            return
+
+        try:
+            # Get existing worktree
+            existing = self._executor_get_worktree(conn, state, worktree_id)
+            if not existing:
+                return
+
+            # Update timestamps
+            now = time.time()
+            existing["indexed_at"] = now
+            existing["updated_at"] = now
+            if head_ref is not None:
+                existing["head_ref"] = head_ref
+
+            # Use merge_insert to update
+            worktree_table = pa.Table.from_pylist(
+                [existing], schema=get_worktrees_schema()
+            )
+            (
+                self._worktrees_table.merge_insert("id")
+                .when_matched_update_all()
+                .execute(worktree_table)
+            )
+        except Exception as e:
+            logger.error(f"Error updating worktree indexed_at: {e}")
+
+    def delete_worktree(self, worktree_id: str) -> bool:
+        """Delete a worktree and all its file inheritances."""
+        return self._execute_in_db_thread_sync("delete_worktree", worktree_id)
+
+    def _executor_delete_worktree(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> bool:
+        """Executor method for delete_worktree - runs in DB thread."""
+        try:
+            # Delete file inheritances first
+            if self._file_inheritance_table:
+                self._file_inheritance_table.delete(f"worktree_id = '{worktree_id}'")
+
+            # Delete worktree record
+            if self._worktrees_table:
+                self._worktrees_table.delete(f"id = '{worktree_id}'")
+
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting worktree: {e}")
+            return False
+
+    # File Worktree Inheritance Operations
+    def create_file_inheritance(
+        self,
+        worktree_id: str,
+        file_id: int,
+        source_worktree_id: str,
+        source_head_ref: str | None = None,
+    ) -> None:
+        """Create a file inheritance record."""
+        return self._execute_in_db_thread_sync(
+            "create_file_inheritance",
+            worktree_id,
+            file_id,
+            source_worktree_id,
+            source_head_ref,
+        )
+
+    def _executor_create_file_inheritance(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        worktree_id: str,
+        file_id: int,
+        source_worktree_id: str,
+        source_head_ref: str | None = None,
+    ) -> None:
+        """Executor method for create_file_inheritance - runs in DB thread."""
+        if not self._file_inheritance_table:
+            self._executor_create_schema(conn, state)
+
+        inheritance_data = {
+            "worktree_id": worktree_id,
+            "file_id": file_id,
+            "source_worktree_id": source_worktree_id,
+            "source_head_ref": source_head_ref or "",
+            "created_at": time.time(),
+        }
+
+        # Use merge_insert for atomic upsert (composite key: worktree_id + file_id)
+        inheritance_table = pa.Table.from_pylist(
+            [inheritance_data], schema=get_file_worktree_inheritance_schema()
+        )
+        # LanceDB doesn't support composite key merge_insert, so we delete then insert
+        try:
+            self._file_inheritance_table.delete(
+                f"worktree_id = '{worktree_id}' AND file_id = {file_id}"
+            )
+        except Exception:
+            pass  # May not exist
+        self._file_inheritance_table.add(inheritance_table, mode="append")
+
+    def create_file_inheritances_batch(
+        self,
+        inheritances: list[dict[str, Any]],
+    ) -> int:
+        """Create multiple file inheritance records in batch."""
+        return self._execute_in_db_thread_sync(
+            "create_file_inheritances_batch", inheritances
+        )
+
+    def _executor_create_file_inheritances_batch(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        inheritances: list[dict[str, Any]],
+    ) -> int:
+        """Executor method for create_file_inheritances_batch - runs in DB thread."""
+        if not inheritances:
+            return 0
+
+        if not self._file_inheritance_table:
+            self._executor_create_schema(conn, state)
+
+        now = time.time()
+        inheritance_data = []
+        for inh in inheritances:
+            inheritance_data.append({
+                "worktree_id": inh["worktree_id"],
+                "file_id": inh["file_id"],
+                "source_worktree_id": inh["source_worktree_id"],
+                "source_head_ref": inh.get("source_head_ref", "") or "",
+                "created_at": now,
+            })
+
+        # Batch insert
+        inheritance_table = pa.Table.from_pylist(
+            inheritance_data, schema=get_file_worktree_inheritance_schema()
+        )
+        self._file_inheritance_table.add(inheritance_table, mode="append")
+
+        return len(inheritances)
+
+    def get_inherited_files(
+        self, worktree_id: str
+    ) -> list[dict[str, Any]]:
+        """Get all inherited files for a worktree."""
+        return self._execute_in_db_thread_sync("get_inherited_files", worktree_id)
+
+    def _executor_get_inherited_files(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> list[dict[str, Any]]:
+        """Executor method for get_inherited_files - runs in DB thread."""
+        if not self._file_inheritance_table:
+            return []
+
+        try:
+            results = (
+                self._file_inheritance_table.search()
+                .where(f"worktree_id = '{worktree_id}'")
+                .to_list()
+            )
+            return [dict(r) for r in results]
+        except Exception as e:
+            logger.error(f"Error getting inherited files: {e}")
+            return []
+
+    def delete_file_inheritance(self, worktree_id: str, file_id: int) -> bool:
+        """Delete a specific file inheritance record."""
+        return self._execute_in_db_thread_sync(
+            "delete_file_inheritance", worktree_id, file_id
+        )
+
+    def _executor_delete_file_inheritance(
+        self, conn: Any, state: dict[str, Any], worktree_id: str, file_id: int
+    ) -> bool:
+        """Executor method for delete_file_inheritance - runs in DB thread."""
+        if not self._file_inheritance_table:
+            return False
+
+        try:
+            self._file_inheritance_table.delete(
+                f"worktree_id = '{worktree_id}' AND file_id = {file_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting file inheritance: {e}")
+            return False
+
+    def clear_worktree_inheritances(self, worktree_id: str) -> int:
+        """Clear all file inheritances for a worktree."""
+        return self._execute_in_db_thread_sync(
+            "clear_worktree_inheritances", worktree_id
+        )
+
+    def _executor_clear_worktree_inheritances(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> int:
+        """Executor method for clear_worktree_inheritances - runs in DB thread."""
+        if not self._file_inheritance_table:
+            return 0
+
+        try:
+            # Count before delete
+            results = (
+                self._file_inheritance_table.search()
+                .where(f"worktree_id = '{worktree_id}'")
+                .to_list()
+            )
+            count = len(results)
+
+            # Delete all inheritances for this worktree
+            self._file_inheritance_table.delete(f"worktree_id = '{worktree_id}'")
+
+            return count
+        except Exception as e:
+            logger.error(f"Error clearing worktree inheritances: {e}")
+            return 0
+
+    def get_stale_inheritances(
+        self, worktree_id: str, current_head_ref: str
+    ) -> list[dict[str, Any]]:
+        """Get file inheritances that are stale (source HEAD changed)."""
+        return self._execute_in_db_thread_sync(
+            "get_stale_inheritances", worktree_id, current_head_ref
+        )
+
+    def _executor_get_stale_inheritances(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        worktree_id: str,
+        current_head_ref: str,
+    ) -> list[dict[str, Any]]:
+        """Executor method for get_stale_inheritances - runs in DB thread."""
+        if not self._file_inheritance_table:
+            return []
+
+        try:
+            # Get all inheritances for this worktree where source_head_ref differs
+            results = (
+                self._file_inheritance_table.search()
+                .where(
+                    f"worktree_id = '{worktree_id}' AND "
+                    f"source_head_ref != '{current_head_ref}'"
+                )
+                .to_list()
+            )
+            return [dict(r) for r in results]
+        except Exception as e:
+            logger.error(f"Error getting stale inheritances: {e}")
+            return []
+
+    def get_worktree_file_count(self, worktree_id: str) -> dict[str, int]:
+        """Get file counts for a worktree (owned and inherited)."""
+        return self._execute_in_db_thread_sync("get_worktree_file_count", worktree_id)
+
+    def _executor_get_worktree_file_count(
+        self, conn: Any, state: dict[str, Any], worktree_id: str
+    ) -> dict[str, int]:
+        """Executor method for get_worktree_file_count - runs in DB thread."""
+        result = {"owned": 0, "inherited": 0, "total": 0}
+
+        try:
+            # Count owned files
+            if self._files_table:
+                owned_results = (
+                    self._files_table.search()
+                    .where(f"worktree_id = '{worktree_id}'")
+                    .to_list()
+                )
+                result["owned"] = len(owned_results)
+
+            # Count inherited files
+            if self._file_inheritance_table:
+                inherited_results = (
+                    self._file_inheritance_table.search()
+                    .where(f"worktree_id = '{worktree_id}'")
+                    .to_list()
+                )
+                result["inherited"] = len(inherited_results)
+
+            result["total"] = result["owned"] + result["inherited"]
+
+        except Exception as e:
+            logger.error(f"Error getting worktree file count: {e}")
+
+        return result
 
     # Chunk Operations
     def insert_chunk(self, chunk: Chunk) -> int:

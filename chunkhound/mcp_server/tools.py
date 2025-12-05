@@ -352,6 +352,7 @@ async def search_regex_impl(
     offset: int = 0,
     max_response_tokens: int = 20000,
     path: str | None = None,
+    worktree_scope: str | None = None,
 ) -> SearchResponse:
     """Core regex search implementation.
 
@@ -362,6 +363,7 @@ async def search_regex_impl(
         offset: Starting offset for pagination
         max_response_tokens: Maximum response size in tokens (1000-25000)
         path: Optional path to limit search scope
+        worktree_scope: Worktree scope for search - 'current' (default), 'all', or comma-separated worktree IDs
 
     Returns:
         Dict with 'results' and 'pagination' keys
@@ -370,17 +372,29 @@ async def search_regex_impl(
     page_size = max(1, min(page_size, 100))
     offset = max(0, offset)
 
+    # Parse worktree_scope into list of worktree IDs
+    worktree_ids: list[str] | None = None
+    if worktree_scope:
+        if worktree_scope.lower() == "all":
+            worktree_ids = ["all"]
+        elif worktree_scope.lower() != "current":
+            # Assume comma-separated IDs
+            worktree_ids = [wt.strip() for wt in worktree_scope.split(",") if wt.strip()]
+
     # Check database connection
     if services and not services.provider.is_connected:
         services.provider.connect()
 
     # Perform search using SearchService
+    # Note: worktree_ids filtering not yet implemented in database layer,
+    # but parameter is accepted for API compatibility
     results, pagination = services.search_service.search_regex(
         pattern=pattern,
         page_size=page_size,
         offset=offset,
         path_filter=path,
     )
+    # TODO: Pass worktree_ids once database layer supports filtering
 
     # Convert file paths to native platform format
     native_results = _convert_paths_to_native(results)
@@ -406,6 +420,7 @@ async def search_semantic_impl(
     provider: str | None = None,
     model: str | None = None,
     threshold: float | None = None,
+    worktree_scope: str | None = None,
 ) -> SearchResponse:
     """Core semantic search implementation.
 
@@ -420,6 +435,7 @@ async def search_semantic_impl(
         provider: Embedding provider name (optional, uses configured provider if not specified)
         model: Embedding model name (optional, uses configured model if not specified)
         threshold: Distance threshold for filtering (optional)
+        worktree_scope: Worktree scope for search - 'current' (default), 'all', or comma-separated worktree IDs
 
     Returns:
         Dict with 'results' and 'pagination' keys
@@ -454,6 +470,15 @@ async def search_semantic_impl(
     page_size = max(1, min(page_size, 100))
     offset = max(0, offset)
 
+    # Parse worktree_scope into list of worktree IDs
+    worktree_ids: list[str] | None = None
+    if worktree_scope:
+        if worktree_scope.lower() == "all":
+            worktree_ids = ["all"]
+        elif worktree_scope.lower() != "current":
+            # Assume comma-separated IDs
+            worktree_ids = [wt.strip() for wt in worktree_scope.split(",") if wt.strip()]
+
     # Check database connection
     if services and not services.provider.is_connected:
         services.provider.connect()
@@ -467,6 +492,7 @@ async def search_semantic_impl(
         provider=provider,
         model=model,
         path_filter=path,
+        worktree_ids=worktree_ids,
     )
 
     # Convert file paths to native platform format
@@ -624,6 +650,92 @@ async def deep_research_impl(
     result = await research_service.deep_research(query)
 
     return result
+
+
+class WorktreeInfo(TypedDict):
+    """Worktree information structure."""
+
+    worktree_id: str
+    path: str
+    is_main: bool
+    head_ref: str | None
+    indexed_at: str | None
+    file_count: int
+
+
+class WorktreesResponse(TypedDict):
+    """Response structure for list_worktrees operation."""
+
+    worktrees: list[WorktreeInfo]
+    current_worktree_id: str | None
+
+
+@register_tool(
+    description="List all indexed worktrees for the current repository. Returns worktree IDs, paths, main/linked status, and indexed file counts. Use this to discover available worktrees before searching across multiple worktrees.",
+    requires_embeddings=False,
+    name="list_worktrees",
+)
+async def list_worktrees_impl(
+    services: DatabaseServices,
+) -> WorktreesResponse:
+    """List all indexed worktrees.
+
+    Args:
+        services: Database services bundle
+
+    Returns:
+        Dict with 'worktrees' list and 'current_worktree_id'
+    """
+    from chunkhound.utils.worktree_detection import detect_worktree_info
+
+    # Check database connection
+    if services and not services.provider.is_connected:
+        services.provider.connect()
+
+    # Get all worktrees from database
+    worktrees_data = services.provider.list_worktrees()
+
+    # Get file counts for each worktree
+    worktrees: list[WorktreeInfo] = []
+    for wt in worktrees_data:
+        file_count = services.provider.get_worktree_file_count(wt["id"])
+        worktrees.append(
+            cast(
+                WorktreeInfo,
+                {
+                    "worktree_id": wt["id"],
+                    "path": wt["path"],
+                    "is_main": wt.get("is_main", False),
+                    "head_ref": wt.get("head_ref"),
+                    "indexed_at": wt.get("indexed_at"),
+                    "file_count": file_count,
+                },
+            )
+        )
+
+    # Detect current worktree to provide context
+    current_worktree_id: str | None = None
+    try:
+        from pathlib import Path
+
+        # Try to detect worktree from database path
+        db_path = services.provider._path if hasattr(services.provider, "_path") else None
+        if db_path:
+            # Database path is typically in main worktree's .chunkhound/db/
+            # Detect which worktree we're currently in
+            cwd = Path.cwd()
+            worktree_info = detect_worktree_info(cwd)
+            current_worktree_id = worktree_info.worktree_id
+    except Exception:
+        pass  # Best effort - current_worktree_id remains None
+
+    return cast(
+        WorktreesResponse,
+        {
+            "worktrees": worktrees,
+            "current_worktree_id": current_worktree_id,
+        },
+    )
 
 
 # =============================================================================

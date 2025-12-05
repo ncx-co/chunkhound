@@ -57,6 +57,7 @@ class MultiHopStrategy:
         provider: str,
         model: str,
         path_filter: str | None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Perform dynamic multi-hop semantic search with reranking.
 
@@ -68,6 +69,7 @@ class MultiHopStrategy:
             provider: Embedding provider name
             model: Embedding model name
             path_filter: Optional relative path to limit search scope
+            worktree_ids: Optional list of worktree IDs to limit search scope
 
         Returns:
             Tuple of (results, pagination_metadata)
@@ -84,6 +86,7 @@ class MultiHopStrategy:
             provider=provider,
             model=model,
             path_filter=path_filter,
+            worktree_ids=worktree_ids,
         )
 
         if len(initial_results) <= 5:
@@ -99,6 +102,7 @@ class MultiHopStrategy:
                 provider=provider,
                 model=model,
                 path_filter=path_filter,
+                worktree_ids=worktree_ids,
             )
 
         # Rerank initial results

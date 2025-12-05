@@ -47,6 +47,14 @@ from chunkhound.utils.file_patterns import (
     walk_subtree_worker,
 )
 
+# Worktree detection for delta indexing
+from chunkhound.utils.worktree_detection import (
+    detect_worktree_info,
+    compute_worktree_id,
+    get_git_head_ref,
+    WorktreeInfo,
+)
+
 
 # CRITICAL FIX: Force spawn multiprocessing start method to prevent fork + asyncio issues
 # RATIONALE: Linux defaults to 'fork' which is unsafe with asyncio event loops
@@ -170,6 +178,11 @@ class IndexingCoordinator(BaseService):
         # Store raw path - will resolve at usage time for consistent symlink handling
         self._base_directory: Path = base_directory
 
+        # Worktree tracking for delta indexing
+        # Set during process_directory() to track current worktree context
+        self._current_worktree_info: WorktreeInfo | None = None
+        self._current_worktree_id: str | None = None
+
     def _get_relative_path(self, file_path: Path) -> Path:
         """Get relative path, preserving symlink logical paths.
 
@@ -177,6 +190,84 @@ class IndexingCoordinator(BaseService):
         and preserves symlink logical paths for git worktree support.
         """
         return get_relative_path_safe(file_path, self._base_directory)
+
+    def _register_worktree(self, directory: Path) -> WorktreeInfo:
+        """Detect and register worktree in database.
+
+        Args:
+            directory: Directory being indexed
+
+        Returns:
+            WorktreeInfo with detected worktree information
+        """
+        worktree_info = detect_worktree_info(directory)
+        head_ref = get_git_head_ref(directory)
+
+        # Determine main worktree ID for linked worktrees
+        main_worktree_id = None
+        if worktree_info.is_linked and worktree_info.main_worktree_path:
+            main_worktree_id = compute_worktree_id(worktree_info.main_worktree_path)
+
+        # Register/update worktree in database
+        try:
+            if hasattr(self._db, 'upsert_worktree'):
+                self._db.upsert_worktree(
+                    worktree_id=worktree_info.worktree_id,
+                    path=str(directory.resolve()),
+                    is_main=worktree_info.is_main,
+                    main_worktree_id=main_worktree_id,
+                    head_ref=head_ref,
+                )
+                logger.debug(
+                    f"Registered worktree: {worktree_info.worktree_id[:8]} "
+                    f"({'main' if worktree_info.is_main else 'linked'})"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to register worktree: {e}")
+
+        return worktree_info
+
+    def _check_main_worktree_indexed(self, worktree_info: WorktreeInfo) -> bool:
+        """Check if the main worktree has been indexed.
+
+        Args:
+            worktree_info: Info about the current (linked) worktree
+
+        Returns:
+            True if main worktree is indexed and has files
+        """
+        if not worktree_info.is_linked or not worktree_info.main_worktree_path:
+            return False
+
+        main_worktree_id = compute_worktree_id(worktree_info.main_worktree_path)
+
+        try:
+            if hasattr(self._db, 'get_worktree'):
+                main_worktree = self._db.get_worktree(main_worktree_id)
+                if main_worktree and main_worktree.get('indexed_at'):
+                    # Check if main has files
+                    if hasattr(self._db, 'get_worktree_file_count'):
+                        counts = self._db.get_worktree_file_count(main_worktree_id)
+                        return counts.get('owned', 0) > 0
+                    return True
+        except Exception as e:
+            logger.debug(f"Failed to check main worktree index status: {e}")
+
+        return False
+
+    def _update_worktree_indexed_at(self, worktree_id: str, head_ref: str | None = None) -> None:
+        """Update worktree indexed_at timestamp after successful indexing.
+
+        Args:
+            worktree_id: Worktree identifier
+            head_ref: Optional current HEAD ref
+        """
+        try:
+            if hasattr(self._db, 'update_worktree_indexed_at'):
+                self._db.update_worktree_indexed_at(worktree_id, head_ref)
+                logger.debug(f"Updated worktree indexed_at: {worktree_id[:8]}")
+        except Exception as e:
+            logger.warning(f"Failed to update worktree indexed_at: {e}")
 
     def add_language_parser(self, language: Language, parser: UniversalParser) -> None:
         """Add or update a language parser.
@@ -1025,6 +1116,18 @@ class IndexingCoordinator(BaseService):
             import time as _t
 
             _t0 = _t.perf_counter() if getattr(self, "profile_startup", False) else None
+
+            # Phase 0: Worktree Detection - Register worktree and determine indexing mode
+            worktree_info = self._register_worktree(directory)
+            self._current_worktree_info = worktree_info
+            self._current_worktree_id = worktree_info.worktree_id
+            head_ref = get_git_head_ref(directory)
+
+            logger.debug(
+                f"Worktree mode: {'main' if worktree_info.is_main else 'linked'} "
+                f"(id: {worktree_info.worktree_id[:8]})"
+            )
+
             # Phase 1: Discovery - Discover files in directory (now parallelized)
             files = await self._discover_files(directory, patterns, exclude_patterns)
             _t1 = _t.perf_counter() if _t0 is not None else None
@@ -1392,6 +1495,10 @@ class IndexingCoordinator(BaseService):
                         "error": error["error"],
                     }
 
+            # Update worktree indexed_at timestamp on successful indexing
+            if self._current_worktree_id:
+                self._update_worktree_indexed_at(self._current_worktree_id, head_ref)
+
             return {
                 "status": "success",
                 "files_processed": total_files,
@@ -1400,6 +1507,7 @@ class IndexingCoordinator(BaseService):
                 "skipped_due_to_timeout": skipped_due_to_timeout,
                 "skipped_unchanged": skipped_unchanged,
                 "skipped_filtered": skipped_filtered,
+                "worktree_id": self._current_worktree_id,
             }
 
 

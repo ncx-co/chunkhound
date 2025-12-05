@@ -59,6 +59,7 @@ class SearchService(BaseService):
         model: str | None = None,
         path_filter: str | None = None,
         force_strategy: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Perform semantic search using vector similarity.
 
@@ -77,6 +78,9 @@ class SearchService(BaseService):
             path_filter: Optional relative path to limit search scope
                 (e.g., 'src/', 'tests/')
             force_strategy: Optional strategy override ('single_hop', 'multi_hop')
+            worktree_ids: Optional list of worktree IDs to limit search scope.
+                If None, searches current worktree (default behavior).
+                Pass ["all"] to search all worktrees.
 
         Returns:
             Tuple of (results, pagination_metadata)
@@ -121,6 +125,13 @@ class SearchService(BaseService):
                     )
                     use_multi_hop = False
 
+            # Log worktree filtering if specified
+            if worktree_ids:
+                if worktree_ids == ["all"]:
+                    logger.debug("Searching across all worktrees")
+                else:
+                    logger.debug(f"Searching worktrees: {worktree_ids}")
+
             if use_multi_hop:
                 logger.debug(f"Using multi-hop search with reranking for: '{query}'")
                 assert self._multi_hop_strategy is not None
@@ -132,6 +143,7 @@ class SearchService(BaseService):
                     provider=search_provider,
                     model=search_model,
                     path_filter=path_filter,
+                    worktree_ids=worktree_ids,
                 )
             else:
                 logger.debug(f"Using standard semantic search for: '{query}'")
@@ -144,6 +156,7 @@ class SearchService(BaseService):
                     provider=search_provider,
                     model=search_model,
                     path_filter=path_filter,
+                    worktree_ids=worktree_ids,
                 )
 
             # Enhance results with additional metadata
@@ -210,6 +223,7 @@ class SearchService(BaseService):
         page_size: int = 10,
         offset: int = 0,
         path_filter: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Perform regex search on code content (asynchronous).
 
@@ -222,6 +236,9 @@ class SearchService(BaseService):
             offset: Starting position for pagination
             path_filter: Optional relative path to limit search scope
                 (e.g., 'src/', 'tests/')
+            worktree_ids: Optional list of worktree IDs to limit search scope.
+                If None, searches current worktree (default behavior).
+                Pass ["all"] to search all worktrees.
 
         Returns:
             Tuple of (results, pagination_metadata)
@@ -229,13 +246,27 @@ class SearchService(BaseService):
         try:
             logger.debug(f"Performing async regex search for pattern: '{pattern}'")
 
+            # Log worktree filtering if specified
+            if worktree_ids:
+                if worktree_ids == ["all"]:
+                    logger.debug("Searching across all worktrees")
+                else:
+                    logger.debug(f"Searching worktrees: {worktree_ids}")
+
+            # Build search kwargs
+            search_kwargs: dict[str, Any] = {
+                "pattern": pattern,
+                "page_size": page_size,
+                "offset": offset,
+                "path_filter": path_filter,
+            }
+
+            # Add worktree_ids if specified (provider may not support it yet)
+            if worktree_ids is not None:
+                search_kwargs["worktree_ids"] = worktree_ids
+
             # Perform async regex search
-            results, pagination = await self._db.search_regex_async(
-                pattern=pattern,
-                page_size=page_size,
-                offset=offset,
-                path_filter=path_filter,
-            )
+            results, pagination = await self._db.search_regex_async(**search_kwargs)
 
             # Enhance results with additional metadata
             enhanced_results = []

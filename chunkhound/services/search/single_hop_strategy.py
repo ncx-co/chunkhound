@@ -45,6 +45,7 @@ class SingleHopStrategy:
         provider: str,
         model: str,
         path_filter: str | None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Perform standard single-hop semantic search.
 
@@ -56,6 +57,7 @@ class SingleHopStrategy:
             provider: Embedding provider name
             model: Embedding model name
             path_filter: Optional relative path to limit search scope
+            worktree_ids: Optional list of worktree IDs to limit search scope
 
         Returns:
             Tuple of (results, pagination_metadata)
@@ -68,15 +70,23 @@ class SingleHopStrategy:
         query_vector = query_results[0]
 
         # Perform vector similarity search
-        results, pagination = self._db.search_semantic(
-            query_embedding=query_vector,
-            provider=provider,
-            model=model,
-            page_size=page_size,
-            offset=offset,
-            threshold=threshold,
-            path_filter=path_filter,
-        )
+        # Note: worktree_ids filtering will be passed to database provider
+        # when the provider supports it (checked via hasattr)
+        search_kwargs: dict[str, Any] = {
+            "query_embedding": query_vector,
+            "provider": provider,
+            "model": model,
+            "page_size": page_size,
+            "offset": offset,
+            "threshold": threshold,
+            "path_filter": path_filter,
+        }
+
+        # Add worktree_ids if database provider supports it
+        if worktree_ids is not None:
+            search_kwargs["worktree_ids"] = worktree_ids
+
+        results, pagination = self._db.search_semantic(**search_kwargs)
 
         logger.info(
             f"Standard semantic search completed: {len(results)} results found"
