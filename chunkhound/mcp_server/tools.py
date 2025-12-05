@@ -386,15 +386,13 @@ async def search_regex_impl(
         services.provider.connect()
 
     # Perform search using SearchService
-    # Note: worktree_ids filtering not yet implemented in database layer,
-    # but parameter is accepted for API compatibility
     results, pagination = services.search_service.search_regex(
         pattern=pattern,
         page_size=page_size,
         offset=offset,
         path_filter=path,
+        worktree_ids=worktree_ids,
     )
-    # TODO: Pass worktree_ids once database layer supports filtering
 
     # Convert file paths to native platform format
     native_results = _convert_paths_to_native(results)
@@ -579,6 +577,53 @@ async def health_check_impl(
     }
 
     return cast(HealthStatus, health_status)
+
+
+@register_tool(
+    description="List all indexed worktrees for the current repository. Returns worktree IDs, paths, main/linked status, and file counts. Use to discover available worktrees before searching with worktree_scope parameter.",
+    requires_embeddings=False,
+    name="list_worktrees",
+)
+async def list_worktrees_impl(
+    services: DatabaseServices,
+) -> dict[str, Any]:
+    """List all indexed worktrees.
+
+    Args:
+        services: Database services bundle
+
+    Returns:
+        Dict with 'worktrees' list containing worktree info
+    """
+    # Ensure DB connection
+    if services and not services.provider.is_connected:
+        services.provider.connect()
+
+    # Get all worktrees from database
+    worktrees = services.provider.list_worktrees()
+
+    # Enrich with file counts
+    enriched_worktrees = []
+    for wt in worktrees:
+        file_counts = services.provider.get_worktree_file_count(wt["id"])
+        enriched_worktrees.append({
+            "id": wt["id"],
+            "path": wt["path"],
+            "is_main": wt["is_main"],
+            "main_worktree_id": wt.get("main_worktree_id"),
+            "head_ref": wt.get("head_ref"),
+            "indexed_at": wt.get("indexed_at"),
+            "file_counts": {
+                "owned": file_counts.get("owned", 0),
+                "inherited": file_counts.get("inherited", 0),
+                "total": file_counts.get("total", 0),
+            },
+        })
+
+    return {
+        "worktrees": enriched_worktrees,
+        "total": len(enriched_worktrees),
+    }
 
 
 @register_tool(

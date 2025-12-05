@@ -178,6 +178,7 @@ class SearchService(BaseService):
         page_size: int = 10,
         offset: int = 0,
         path_filter: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Perform regex search on code content (synchronous).
 
@@ -187,6 +188,9 @@ class SearchService(BaseService):
             offset: Starting position for pagination
             path_filter: Optional relative path to limit search scope
                 (e.g., 'src/', 'tests/')
+            worktree_ids: Optional list of worktree IDs to limit search scope.
+                If None, searches all files (no filtering).
+                Pass ["all"] to explicitly search all worktrees.
 
         Returns:
             Tuple of (results, pagination_metadata)
@@ -200,6 +204,7 @@ class SearchService(BaseService):
                 page_size=page_size,
                 offset=offset,
                 path_filter=path_filter,
+                worktree_ids=worktree_ids,
             )
 
             # Enhance results with additional metadata
