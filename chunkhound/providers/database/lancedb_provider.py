@@ -1143,6 +1143,46 @@ class LanceDBProvider(SerialDatabaseProvider):
 
         return result
 
+    def _get_worktree_scoped_file_ids(self, worktree_ids: list[str]) -> set[int]:
+        """Get file IDs visible to the specified worktrees (owned + inherited).
+
+        This is a helper method for search filtering. It runs in the DB thread
+        context since it's called from executor methods.
+
+        Args:
+            worktree_ids: List of worktree IDs to scope to
+
+        Returns:
+            Set of file IDs that are visible to the specified worktrees
+        """
+        file_ids: set[int] = set()
+
+        try:
+            # Get owned files for these worktrees
+            if self._files_table:
+                for wt_id in worktree_ids:
+                    owned_results = (
+                        self._files_table.search()
+                        .where(f"worktree_id = '{wt_id}'")
+                        .to_list()
+                    )
+                    file_ids.update(r["id"] for r in owned_results)
+
+            # Get inherited files for these worktrees
+            if self._file_inheritance_table:
+                for wt_id in worktree_ids:
+                    inherited_results = (
+                        self._file_inheritance_table.search()
+                        .where(f"worktree_id = '{wt_id}'")
+                        .to_list()
+                    )
+                    file_ids.update(r["file_id"] for r in inherited_results)
+
+        except Exception as e:
+            logger.error(f"Error getting worktree scoped file IDs: {e}")
+
+        return file_ids
+
     # Chunk Operations
     def insert_chunk(self, chunk: Chunk) -> int:
         """Insert chunk record and return chunk ID."""
@@ -1849,6 +1889,7 @@ class LanceDBProvider(SerialDatabaseProvider):
         offset: int = 0,
         threshold: float | None = None,
         path_filter: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Executor method for search_semantic - runs in DB thread."""
         if self._chunks_table is None:
@@ -1899,6 +1940,19 @@ class LanceDBProvider(SerialDatabaseProvider):
                     "total": 0,
                 }
 
+            # Build worktree-scoped file IDs if filtering by worktree
+            valid_file_ids: set[int] | None = None
+            if worktree_ids is not None and worktree_ids != ["all"]:
+                valid_file_ids = self._get_worktree_scoped_file_ids(worktree_ids)
+                if not valid_file_ids:
+                    # No files match the worktree filter
+                    return [], {
+                        "offset": offset,
+                        "page_size": 0,
+                        "has_more": False,
+                        "total": 0,
+                    }
+
             # Perform vector search with explicit vector column name
             query = self._chunks_table.search(
                 query_embedding, vector_column_name="embedding"
@@ -1906,7 +1960,8 @@ class LanceDBProvider(SerialDatabaseProvider):
             query = query.where(
                 f"provider = '{provider}' AND model = '{model}' AND embedding IS NOT NULL"
             )
-            query = query.limit(page_size + offset)
+            # Request more results to account for worktree filtering
+            query = query.limit((page_size + offset) * 3 if valid_file_ids else page_size + offset)
 
             if threshold:
                 query = query.where(f"_distance <= {threshold}")
@@ -1919,6 +1974,10 @@ class LanceDBProvider(SerialDatabaseProvider):
 
             # Deduplicate across fragments (safety net for fragment-induced duplicates)
             results = _deduplicate_by_id(results)
+
+            # Apply worktree filtering post-query
+            if valid_file_ids is not None:
+                results = [r for r in results if r.get("file_id") in valid_file_ids]
 
             # Apply offset manually since LanceDB doesn't have native offset
             paginated_results = results[offset : offset + page_size]
@@ -2140,12 +2199,26 @@ class LanceDBProvider(SerialDatabaseProvider):
         page_size: int,
         offset: int,
         path_filter: str | None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Executor method for search_regex - runs in DB thread."""
         if not self._chunks_table or not self._files_table:
             return [], {"offset": offset, "page_size": 0, "has_more": False, "total": 0}
 
         try:
+            # Build worktree-scoped file IDs if filtering by worktree
+            valid_file_ids: set[int] | None = None
+            if worktree_ids is not None and worktree_ids != ["all"]:
+                valid_file_ids = self._get_worktree_scoped_file_ids(worktree_ids)
+                if not valid_file_ids:
+                    # No files match the worktree filter
+                    return [], {
+                        "offset": offset,
+                        "page_size": 0,
+                        "has_more": False,
+                        "total": 0,
+                    }
+
             # Build WHERE clause using regexp_match (DataFusion SQL function)
             # Escape single quotes in pattern to prevent SQL injection
             escaped_pattern = pattern.replace("'", "''")
@@ -2158,6 +2231,10 @@ class LanceDBProvider(SerialDatabaseProvider):
             # Deduplicate across fragments (critical fix for fragmentation bug)
             results = _deduplicate_by_id(results)
 
+            # Apply worktree filtering
+            if valid_file_ids is not None:
+                results = [r for r in results if r.get("file_id") in valid_file_ids]
+
             # Apply path filter if provided
             if path_filter:
                 # Get file IDs matching path filter
@@ -2165,8 +2242,8 @@ class LanceDBProvider(SerialDatabaseProvider):
                 file_results = self._files_table.search().where(
                     f"path LIKE '{escaped_path}%'"
                 ).to_list()
-                valid_file_ids = {r["id"] for r in file_results}
-                results = [r for r in results if r["file_id"] in valid_file_ids]
+                path_file_ids = {r["id"] for r in file_results}
+                results = [r for r in results if r["file_id"] in path_file_ids]
 
             total_count = len(results)
 

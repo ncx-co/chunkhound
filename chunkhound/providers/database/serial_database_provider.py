@@ -237,8 +237,16 @@ class SerialDatabaseProvider(ABC):
         offset: int = 0,
         threshold: float | None = None,
         path_filter: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Perform semantic vector search if supported."""
+        """Perform semantic vector search if supported.
+
+        Args:
+            worktree_ids: Optional list of worktree IDs to limit search scope.
+                If None, searches all indexed files (no filtering).
+                Pass ["all"] to explicitly search all worktrees.
+                Pass specific IDs to search only those worktrees (including inherited files).
+        """
         if not hasattr(self, "_executor_search_semantic"):
             return [], {"error": "Semantic search not supported by this provider"}
 
@@ -251,6 +259,7 @@ class SerialDatabaseProvider(ABC):
             offset,
             threshold,
             path_filter,
+            worktree_ids,
         )
 
     def search_regex(
@@ -259,13 +268,21 @@ class SerialDatabaseProvider(ABC):
         page_size: int = 10,
         offset: int = 0,
         path_filter: str | None = None,
+        worktree_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Perform regex search if supported (synchronous)."""
+        """Perform regex search if supported (synchronous).
+
+        Args:
+            worktree_ids: Optional list of worktree IDs to limit search scope.
+                If None, searches all indexed files (no filtering).
+                Pass ["all"] to explicitly search all worktrees.
+                Pass specific IDs to search only those worktrees (including inherited files).
+        """
         if not hasattr(self, "_executor_search_regex"):
             return [], {"error": "Regex search not supported by this provider"}
 
         return self._execute_in_db_thread_sync(
-            "search_regex", pattern, page_size, offset, path_filter
+            "search_regex", pattern, page_size, offset, path_filter, worktree_ids
         )
 
     async def search_regex_async(
