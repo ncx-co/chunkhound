@@ -76,6 +76,12 @@ class IndexingConfig(BaseModel):
         ),
     )
 
+    # Git worktree support
+    worktree_support_enabled: bool = Field(
+        default=False,
+        description="Enable Git worktree-aware indexing with delta updates and shared databases",
+    )
+
     # Parallel discovery settings
     parallel_discovery: bool = Field(
         default=True,
@@ -357,6 +363,12 @@ class IndexingConfig(BaseModel):
             ),
         )
 
+        parser.add_argument(
+            "--worktree-support",
+            action="store_true",
+            help="Enable Git worktree-aware indexing with delta updates and shared databases",
+        )
+
     @classmethod
     def load_from_env(cls) -> dict[str, Any]:
         """Load indexing config from environment variables."""
@@ -427,6 +439,10 @@ class IndexingConfig(BaseModel):
         # Non‑repo workspace .gitignore toggle
         if wr := os.getenv("CHUNKHOUND_INDEXING__WORKSPACE_GITIGNORE_NONREPO"):
             config["workspace_gitignore_nonrepo"] = wr.strip().lower() not in ("0", "false", "no")
+
+        # Git worktree support toggle
+        if worktree_support := os.getenv("CHUNKHOUND_INDEXING__WORKTREE_SUPPORT_ENABLED"):
+            config["worktree_support_enabled"] = worktree_support.lower() in ("true", "1", "yes")
 
         return config
 
@@ -558,6 +574,10 @@ class IndexingConfig(BaseModel):
         # Discovery backend override via CLI (if present)
         if hasattr(args, "discovery_backend") and args.discovery_backend is not None:
             overrides["discovery_backend"] = str(args.discovery_backend)
+
+        # Git worktree support override via CLI
+        if hasattr(args, "worktree_support") and args.worktree_support:
+            overrides["worktree_support_enabled"] = True
 
         return overrides
 

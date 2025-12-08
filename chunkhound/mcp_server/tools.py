@@ -372,18 +372,20 @@ async def search_regex_impl(
     page_size = max(1, min(page_size, 100))
     offset = max(0, offset)
 
+    # Check database connection
+    if services and not services.provider.is_connected:
+        services.provider.connect()
+
     # Parse worktree_scope into list of worktree IDs
+    # When worktree support is disabled, ignore worktree_scope parameter
     worktree_ids: list[str] | None = None
-    if worktree_scope:
+    worktree_enabled = getattr(services.provider, "worktree_enabled", False)
+    if worktree_enabled and worktree_scope:
         if worktree_scope.lower() == "all":
             worktree_ids = ["all"]
         elif worktree_scope.lower() != "current":
             # Assume comma-separated IDs
             worktree_ids = [wt.strip() for wt in worktree_scope.split(",") if wt.strip()]
-
-    # Check database connection
-    if services and not services.provider.is_connected:
-        services.provider.connect()
 
     # Perform search using SearchService
     results, pagination = services.search_service.search_regex(
@@ -469,8 +471,10 @@ async def search_semantic_impl(
     offset = max(0, offset)
 
     # Parse worktree_scope into list of worktree IDs
+    # When worktree support is disabled, ignore worktree_scope parameter
     worktree_ids: list[str] | None = None
-    if worktree_scope:
+    worktree_enabled = getattr(services.provider, "worktree_enabled", False)
+    if worktree_enabled and worktree_scope:
         if worktree_scope.lower() == "all":
             worktree_ids = ["all"]
         elif worktree_scope.lower() != "current":
@@ -577,53 +581,6 @@ async def health_check_impl(
     }
 
     return cast(HealthStatus, health_status)
-
-
-@register_tool(
-    description="List all indexed worktrees for the current repository. Returns worktree IDs, paths, main/linked status, and file counts. Use to discover available worktrees before searching with worktree_scope parameter.",
-    requires_embeddings=False,
-    name="list_worktrees",
-)
-async def list_worktrees_impl(
-    services: DatabaseServices,
-) -> dict[str, Any]:
-    """List all indexed worktrees.
-
-    Args:
-        services: Database services bundle
-
-    Returns:
-        Dict with 'worktrees' list containing worktree info
-    """
-    # Ensure DB connection
-    if services and not services.provider.is_connected:
-        services.provider.connect()
-
-    # Get all worktrees from database
-    worktrees = services.provider.list_worktrees()
-
-    # Enrich with file counts
-    enriched_worktrees = []
-    for wt in worktrees:
-        file_counts = services.provider.get_worktree_file_count(wt["id"])
-        enriched_worktrees.append({
-            "id": wt["id"],
-            "path": wt["path"],
-            "is_main": wt["is_main"],
-            "main_worktree_id": wt.get("main_worktree_id"),
-            "head_ref": wt.get("head_ref"),
-            "indexed_at": wt.get("indexed_at"),
-            "file_counts": {
-                "owned": file_counts.get("owned", 0),
-                "inherited": file_counts.get("inherited", 0),
-                "total": file_counts.get("total", 0),
-            },
-        })
-
-    return {
-        "worktrees": enriched_worktrees,
-        "total": len(enriched_worktrees),
-    }
 
 
 @register_tool(
@@ -736,6 +693,21 @@ async def list_worktrees_impl(
     # Check database connection
     if services and not services.provider.is_connected:
         services.provider.connect()
+
+    # Check if worktree support is enabled
+    worktree_enabled = getattr(services.provider, "worktree_enabled", False)
+    if not worktree_enabled:
+        return cast(
+            WorktreesResponse,
+            {
+                "worktrees": [],
+                "current_worktree_id": None,
+                "message": (
+                    "Worktree support is disabled. Enable with --worktree-support flag "
+                    "or set CHUNKHOUND_INDEXING__WORKTREE_SUPPORT_ENABLED=true"
+                ),
+            },
+        )
 
     # Get all worktrees from database
     worktrees_data = services.provider.list_worktrees()

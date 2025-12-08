@@ -220,6 +220,16 @@ class StdioMCPServer(MCPServerBase):
                 ):
                     continue
 
+                # Skip worktree-specific tools when worktree support is disabled
+                if tool_name == "list_worktrees":
+                    worktree_enabled = (
+                        self.config.indexing.worktree_support_enabled
+                        if self.config and self.config.indexing
+                        else False
+                    )
+                    if not worktree_enabled:
+                        continue
+
                 tools.append(
                     types.Tool(
                         name=tool_name,

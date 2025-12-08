@@ -281,8 +281,15 @@ class Config(BaseModel):
             start_path = self.target_dir
             project_root = find_project_root(start_path)
 
-            # Set default database path in project root
-            self.database.path = project_root / ".chunkhound" / "db"
+            # Set database path using worktree-aware resolution if enabled
+            worktree_enabled = (
+                self.indexing.worktree_support_enabled
+                if self.indexing
+                else False
+            )
+            self.database.path = self.database.resolve_worktree_db_path(
+                project_root, worktree_enabled=worktree_enabled
+            )
 
         # Ensure database path is resolved to canonical form (handles symlinks)
         if self.database.path:

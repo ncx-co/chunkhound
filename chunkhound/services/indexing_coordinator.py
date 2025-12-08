@@ -185,6 +185,13 @@ class IndexingCoordinator(BaseService):
         self._current_worktree_info: WorktreeInfo | None = None
         self._current_worktree_id: str | None = None
 
+    @property
+    def _worktree_support_enabled(self) -> bool:
+        """Check if worktree support is enabled via config."""
+        if self.config and getattr(self.config, "indexing", None):
+            return bool(getattr(self.config.indexing, "worktree_support_enabled", False))
+        return False
+
     def _get_relative_path(self, file_path: Path) -> Path:
         """Get relative path, preserving symlink logical paths.
 
@@ -1219,49 +1226,57 @@ class IndexingCoordinator(BaseService):
 
             _t0 = _t.perf_counter() if getattr(self, "profile_startup", False) else None
 
-            # Phase 0: Worktree Detection - Register worktree and determine indexing mode
-            worktree_info = self._register_worktree(directory)
-            self._current_worktree_info = worktree_info
-            self._current_worktree_id = worktree_info.worktree_id
-            head_ref = get_git_head_ref(directory)
-
-            logger.debug(
-                f"Worktree mode: {'main' if worktree_info.is_main else 'linked'} "
-                f"(id: {worktree_info.worktree_id[:8]})"
-            )
-
-            # Phase 0.5: Delta Indexing Check - Use delta indexing for linked worktrees
-            # when main worktree is already indexed
+            # Initialize worktree tracking variables
+            worktree_info: WorktreeInfo | None = None
             delta_mode = False
             delta_files: dict[str, list[Path]] | None = None
+            head_ref: str | None = None
 
-            if worktree_info.is_linked and self._check_main_worktree_indexed(worktree_info):
-                logger.info(
-                    f"Delta indexing: linked worktree detected, main worktree is indexed"
+            # Phase 0: Worktree Detection - Only when worktree support is enabled
+            if self._worktree_support_enabled:
+                worktree_info = self._register_worktree(directory)
+                self._current_worktree_info = worktree_info
+                self._current_worktree_id = worktree_info.worktree_id
+                head_ref = get_git_head_ref(directory)
+
+                logger.debug(
+                    f"Worktree mode: {'main' if worktree_info.is_main else 'linked'} "
+                    f"(id: {worktree_info.worktree_id[:8]})"
                 )
-                try:
-                    main_worktree_path = worktree_info.main_worktree_path
-                    if main_worktree_path:
-                        # Compute file changes between main and feature worktree
-                        delta_files = compute_changed_files_via_git(
-                            main_worktree=main_worktree_path,
-                            feature_worktree=directory,
-                            patterns=patterns or [],
-                            exclude_patterns=exclude_patterns or [],
-                        )
-                        delta_mode = True
-                        logger.info(
-                            f"Delta analysis: +{len(delta_files['added'])} added, "
-                            f"~{len(delta_files['modified'])} modified, "
-                            f"-{len(delta_files['deleted'])} deleted, "
-                            f"={len(delta_files['unchanged'])} unchanged"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Delta indexing failed, falling back to full indexing: {e}"
+
+                # Phase 0.5: Delta Indexing Check - Use delta indexing for linked worktrees
+                # when main worktree is already indexed
+                if worktree_info.is_linked and self._check_main_worktree_indexed(worktree_info):
+                    logger.info(
+                        f"Delta indexing: linked worktree detected, main worktree is indexed"
                     )
-                    delta_mode = False
-                    delta_files = None
+                    try:
+                        main_worktree_path = worktree_info.main_worktree_path
+                        if main_worktree_path:
+                            # Compute file changes between main and feature worktree
+                            delta_files = compute_changed_files_via_git(
+                                main_worktree=main_worktree_path,
+                                feature_worktree=directory,
+                                patterns=patterns or [],
+                                exclude_patterns=exclude_patterns or [],
+                            )
+                            delta_mode = True
+                            logger.info(
+                                f"Delta analysis: +{len(delta_files['added'])} added, "
+                                f"~{len(delta_files['modified'])} modified, "
+                                f"-{len(delta_files['deleted'])} deleted, "
+                                f"={len(delta_files['unchanged'])} unchanged"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Delta indexing failed, falling back to full indexing: {e}"
+                        )
+                        delta_mode = False
+                        delta_files = None
+            else:
+                # Worktree support disabled - clear any existing tracking state
+                self._current_worktree_info = None
+                self._current_worktree_id = None
 
             # Phase 1: Discovery - Discover files in directory (now parallelized)
             # For delta mode, use computed changed files instead of full discovery
@@ -1277,7 +1292,8 @@ class IndexingCoordinator(BaseService):
             _t1 = _t.perf_counter() if _t0 is not None else None
 
             # Handle delta mode with no changed files but unchanged files to inherit
-            if not files and delta_mode and delta_files is not None:
+            # (only when worktree support is enabled)
+            if not files and delta_mode and delta_files is not None and worktree_info is not None:
                 # Create inheritance records for unchanged files even if no changes
                 inherited_count = await self._create_inheritance_records(
                     worktree_info=worktree_info,
@@ -1674,7 +1690,8 @@ class IndexingCoordinator(BaseService):
                 )
 
             # Update worktree indexed_at timestamp on successful indexing
-            if self._current_worktree_id:
+            # (only when worktree support is enabled)
+            if self._worktree_support_enabled and self._current_worktree_id:
                 self._update_worktree_indexed_at(self._current_worktree_id, head_ref)
 
             result = {

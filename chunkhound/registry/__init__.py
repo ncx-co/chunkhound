@@ -286,12 +286,20 @@ class ProviderRegistry:
         # Get base directory from config (guaranteed to be set)
         base_directory = self._config.target_dir
 
+        # Determine if worktree support is enabled
+        worktree_enabled = (
+            self._config.indexing.worktree_support_enabled
+            if self._config.indexing
+            else False
+        )
+
         # Create the appropriate provider
         if provider_type == "duckdb":
             from chunkhound.providers.database.duckdb_provider import DuckDBProvider
 
             provider = DuckDBProvider(
-                db_path, base_directory, config=self._config.database
+                db_path, base_directory, config=self._config.database,
+                worktree_enabled=worktree_enabled
             )
         elif provider_type == "lancedb":
             from chunkhound.providers.database.lancedb_provider import LanceDBProvider
@@ -302,14 +310,16 @@ class ProviderRegistry:
             provider = LanceDBProvider(
                 db_path, base_directory,
                 embedding_manager=embedding_manager,
-                config=self._config.database
+                config=self._config.database,
+                worktree_enabled=worktree_enabled
             )
         else:
             logger.warning(f"Unknown provider {provider_type}, defaulting to DuckDB")
             from chunkhound.providers.database.duckdb_provider import DuckDBProvider
 
             provider = DuckDBProvider(
-                db_path, base_directory, config=self._config.database
+                db_path, base_directory, config=self._config.database,
+                worktree_enabled=worktree_enabled
             )
 
         # Connect and register

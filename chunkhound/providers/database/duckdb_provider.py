@@ -61,6 +61,7 @@ class DuckDBProvider(SerialDatabaseProvider):
         base_directory: Path,
         embedding_manager: "EmbeddingManager | None" = None,
         config: "DatabaseConfig | None" = None,
+        worktree_enabled: bool = False,
     ):
         """Initialize DuckDB provider.
 
@@ -69,9 +70,13 @@ class DuckDBProvider(SerialDatabaseProvider):
             base_directory: Base directory for path normalization
             embedding_manager: Optional embedding manager for vector generation
             config: Database configuration for provider-specific settings
+            worktree_enabled: Whether worktree support features are enabled
         """
         # Initialize base class
         super().__init__(db_path, base_directory, embedding_manager, config)
+
+        # Store worktree feature flag
+        self._worktree_enabled = worktree_enabled
 
         self.provider_type = "duckdb"  # Identify this as DuckDB provider
 
@@ -106,6 +111,11 @@ class DuckDBProvider(SerialDatabaseProvider):
                 "temp_drop_s": 0.0,
             }
         }
+
+    @property
+    def worktree_enabled(self) -> bool:
+        """Check if worktree support is enabled."""
+        return self._worktree_enabled
 
     def _create_connection(self) -> Any:
         """Create and return a DuckDB connection.
@@ -506,31 +516,35 @@ class DuckDBProvider(SerialDatabaseProvider):
                 CREATE INDEX IF NOT EXISTS idx_embeddings_1536_chunk_id ON embeddings_1536(chunk_id)
             """)
 
-            # Worktrees table - tracks git worktree metadata
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS worktrees (
-                    id TEXT PRIMARY KEY,
-                    path TEXT NOT NULL,
-                    is_main BOOLEAN NOT NULL,
-                    main_worktree_id TEXT,
-                    head_ref TEXT,
-                    indexed_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # Worktree auxiliary tables - only created when worktree support is enabled
+            # Note: worktree_id column on files is ALWAYS present (for simpler migration)
+            if self._worktree_enabled:
+                # Worktrees table - tracks git worktree metadata
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS worktrees (
+                        id TEXT PRIMARY KEY,
+                        path TEXT NOT NULL,
+                        is_main BOOLEAN NOT NULL,
+                        main_worktree_id TEXT,
+                        head_ref TEXT,
+                        indexed_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
 
-            # File worktree inheritance - tracks files inherited from main worktree
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS file_worktree_inheritance (
-                    worktree_id TEXT NOT NULL,
-                    file_id INTEGER NOT NULL,
-                    source_worktree_id TEXT NOT NULL,
-                    source_head_ref TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (worktree_id, file_id)
-                )
-            """)
+                # File worktree inheritance - tracks files inherited from main worktree
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS file_worktree_inheritance (
+                        worktree_id TEXT NOT NULL,
+                        file_id INTEGER NOT NULL,
+                        source_worktree_id TEXT NOT NULL,
+                        source_head_ref TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (worktree_id, file_id)
+                    )
+                """)
+                logger.debug("Worktree auxiliary tables created (worktree support enabled)")
 
             # Handle schema migrations for existing databases
             self._executor_migrate_schema(conn, state)
@@ -543,14 +557,94 @@ class DuckDBProvider(SerialDatabaseProvider):
             logger.error(f"Failed to create DuckDB schema: {e}")
             raise
 
+    def _executor_migrate_worktree_support(
+        self, conn: Any, state: dict[str, Any]
+    ) -> None:
+        """Migrate existing database to support worktrees when feature is enabled.
+
+        This handles the case where:
+        1. User has existing database without worktree support
+        2. User enables worktree_support_enabled=True
+        3. Existing files need their worktree_id populated
+
+        Args:
+            conn: Database connection
+            state: Executor state dict
+        """
+        if not self._worktree_enabled:
+            return
+
+        try:
+            # Check if there are files with NULL worktree_id
+            result = conn.execute("""
+                SELECT COUNT(*) FROM files WHERE worktree_id IS NULL
+            """).fetchone()
+
+            files_without_worktree = result[0] if result else 0
+            if files_without_worktree == 0:
+                return  # No migration needed
+
+            logger.info(
+                f"Migrating {files_without_worktree} files to worktree support"
+            )
+
+            # Compute worktree ID for the base directory
+            from chunkhound.utils.worktree_detection import detect_worktree_info
+
+            worktree_info = detect_worktree_info(self._base_directory)
+
+            if not worktree_info.worktree_id:
+                logger.warning(
+                    "Could not determine worktree ID for base directory, "
+                    "files will retain NULL worktree_id"
+                )
+                return
+
+            # Update all files with NULL worktree_id to current worktree
+            conn.execute(
+                "UPDATE files SET worktree_id = ? WHERE worktree_id IS NULL",
+                [worktree_info.worktree_id],
+            )
+
+            # Register the worktree in the worktrees table
+            conn.execute(
+                """
+                INSERT INTO worktrees (id, path, is_main, main_worktree_id, head_ref, indexed_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    path = EXCLUDED.path,
+                    head_ref = EXCLUDED.head_ref,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [
+                    worktree_info.worktree_id,
+                    str(worktree_info.worktree_path or self._base_directory),
+                    worktree_info.is_main,
+                    worktree_info.main_worktree_id,
+                    worktree_info.head_ref,
+                ],
+            )
+
+            logger.info(
+                f"Successfully migrated {files_without_worktree} files to "
+                f"worktree '{worktree_info.worktree_id}'"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to migrate worktree support: {e}")
+            # Non-fatal - worktree_id will remain NULL for existing files
+
     def _executor_migrate_schema(self, conn: Any, state: dict[str, Any]) -> None:
         """Executor method for schema migrations - runs in DB thread."""
         try:
+            # Migrate worktree support for existing databases
+            self._executor_migrate_worktree_support(conn, state)
+
             # Check if 'size' and 'signature' columns exist and drop them
             columns_info = conn.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'chunks' 
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'chunks'
                 AND column_name IN ('size', 'signature')
             """).fetchall()
 
@@ -657,27 +751,28 @@ class DuckDBProvider(SerialDatabaseProvider):
                 "CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol)"
             )
 
-            # Worktree indexes
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_worktrees_main ON worktrees(main_worktree_id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_worktrees_path ON worktrees(path)"
-            )
+            # Worktree indexes - only created when worktree support is enabled
+            if self._worktree_enabled:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_worktrees_main ON worktrees(main_worktree_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_worktrees_path ON worktrees(path)"
+                )
 
-            # File inheritance indexes
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_file_inheritance_worktree "
-                "ON file_worktree_inheritance(worktree_id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_file_inheritance_file "
-                "ON file_worktree_inheritance(file_id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_file_inheritance_source "
-                "ON file_worktree_inheritance(source_worktree_id)"
-            )
+                # File inheritance indexes
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_file_inheritance_worktree "
+                    "ON file_worktree_inheritance(worktree_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_file_inheritance_file "
+                    "ON file_worktree_inheritance(file_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_file_inheritance_source "
+                    "ON file_worktree_inheritance(source_worktree_id)"
+                )
 
             # Embedding indexes are created per-table in _executor_ensure_embedding_table_exists()
 

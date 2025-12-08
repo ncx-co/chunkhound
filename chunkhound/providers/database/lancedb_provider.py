@@ -157,6 +157,7 @@ class LanceDBProvider(SerialDatabaseProvider):
         base_directory: Path,
         embedding_manager: EmbeddingManager | None = None,
         config: "DatabaseConfig | None" = None,
+        worktree_enabled: bool = False,
     ):
         """Initialize LanceDB provider.
 
@@ -165,6 +166,7 @@ class LanceDBProvider(SerialDatabaseProvider):
             base_directory: Base directory for path normalization
             embedding_manager: Optional embedding manager for vector generation
             config: Database configuration for provider-specific settings
+            worktree_enabled: Whether worktree support features are enabled
         """
         # Database path expected from DatabaseConfig.get_db_path() with .lancedb suffix
         # Ensure it's absolute to avoid LanceDB internal path resolution issues
@@ -172,6 +174,9 @@ class LanceDBProvider(SerialDatabaseProvider):
 
         # Initialize base class
         super().__init__(absolute_db_path, base_directory, embedding_manager, config)
+
+        # Store worktree feature flag
+        self._worktree_enabled = worktree_enabled
 
         self.index_type = config.lancedb_index_type if config else None
         self._fragment_threshold = (
@@ -186,6 +191,11 @@ class LanceDBProvider(SerialDatabaseProvider):
         self._chunks_table = None
         self._worktrees_table = None
         self._file_inheritance_table = None
+
+    @property
+    def worktree_enabled(self) -> bool:
+        """Check if worktree support is enabled."""
+        return self._worktree_enabled
 
     def _create_connection(self) -> Any:
         """Create and return a LanceDB connection.
@@ -333,27 +343,118 @@ class LanceDBProvider(SerialDatabaseProvider):
             )
             logger.info("Created chunks table")
 
-        # Create worktrees table if it doesn't exist
-        try:
-            self._worktrees_table = conn.open_table("worktrees")
-            logger.debug("Opened existing worktrees table")
-        except Exception:
-            # Table doesn't exist, create it
-            self._worktrees_table = conn.create_table(
-                "worktrees", schema=get_worktrees_schema()
-            )
-            logger.info("Created worktrees table")
+        # Worktree auxiliary tables - only created when worktree support is enabled
+        # Note: worktree_id field on files/chunks is ALWAYS present (for simpler migration)
+        if self._worktree_enabled:
+            # Create worktrees table if it doesn't exist
+            try:
+                self._worktrees_table = conn.open_table("worktrees")
+                logger.debug("Opened existing worktrees table")
+            except Exception:
+                # Table doesn't exist, create it
+                self._worktrees_table = conn.create_table(
+                    "worktrees", schema=get_worktrees_schema()
+                )
+                logger.info("Created worktrees table")
 
-        # Create file_worktree_inheritance table if it doesn't exist
+            # Create file_worktree_inheritance table if it doesn't exist
+            try:
+                self._file_inheritance_table = conn.open_table("file_worktree_inheritance")
+                logger.debug("Opened existing file_worktree_inheritance table")
+            except Exception:
+                # Table doesn't exist, create it
+                self._file_inheritance_table = conn.create_table(
+                    "file_worktree_inheritance", schema=get_file_worktree_inheritance_schema()
+                )
+                logger.info("Created file_worktree_inheritance table")
+
+            logger.debug("Worktree auxiliary tables created (worktree support enabled)")
+
+            # Migrate existing files to worktree support
+            self._executor_migrate_worktree_support(conn, state)
+
+    def _executor_migrate_worktree_support(
+        self, conn: Any, state: dict[str, Any]
+    ) -> None:
+        """Migrate existing database to support worktrees when feature is enabled.
+
+        This handles the case where:
+        1. User has existing database without worktree support
+        2. User enables worktree_support_enabled=True
+        3. Existing files need their worktree_id populated
+
+        Args:
+            conn: Database connection
+            state: Executor state dict
+        """
+        if not self._worktree_enabled:
+            return
+
         try:
-            self._file_inheritance_table = conn.open_table("file_worktree_inheritance")
-            logger.debug("Opened existing file_worktree_inheritance table")
-        except Exception:
-            # Table doesn't exist, create it
-            self._file_inheritance_table = conn.create_table(
-                "file_worktree_inheritance", schema=get_file_worktree_inheritance_schema()
+            # Check if there are files with NULL worktree_id
+            files_df = self._files_table.to_pandas()
+            files_without_worktree = files_df[files_df["worktree_id"].isna()]
+
+            if len(files_without_worktree) == 0:
+                return  # No migration needed
+
+            logger.info(
+                f"Migrating {len(files_without_worktree)} files to worktree support"
             )
-            logger.info("Created file_worktree_inheritance table")
+
+            # Compute worktree ID for the base directory
+            from chunkhound.utils.worktree_detection import detect_worktree_info
+
+            worktree_info = detect_worktree_info(self._base_directory)
+
+            if not worktree_info.worktree_id:
+                logger.warning(
+                    "Could not determine worktree ID for base directory, "
+                    "files will retain NULL worktree_id"
+                )
+                return
+
+            # Update all files with NULL worktree_id to current worktree
+            # LanceDB doesn't have direct UPDATE, so we use merge_insert
+            import pyarrow as pa
+
+            # Batch update: create a new table with updated worktree_ids
+            updated_records = []
+            for _, row in files_without_worktree.iterrows():
+                record = row.to_dict()
+                record["worktree_id"] = worktree_info.worktree_id
+                updated_records.append(record)
+
+            if updated_records:
+                update_table = pa.Table.from_pylist(updated_records)
+                self._files_table.merge_insert("id").when_matched_update_all().execute(
+                    update_table
+                )
+
+            # Register the worktree in the worktrees table
+            from datetime import datetime
+
+            self._worktrees_table.merge_insert("id").when_matched_update_all().execute(
+                pa.table({
+                    "id": [worktree_info.worktree_id],
+                    "path": [str(worktree_info.worktree_path or self._base_directory)],
+                    "is_main": [worktree_info.is_main],
+                    "main_worktree_id": [worktree_info.main_worktree_id],
+                    "head_ref": [worktree_info.head_ref],
+                    "indexed_at": [datetime.now()],
+                    "created_at": [datetime.now()],
+                    "updated_at": [datetime.now()],
+                })
+            )
+
+            logger.info(
+                f"Successfully migrated {len(files_without_worktree)} files to "
+                f"worktree '{worktree_info.worktree_id}'"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to migrate worktree support: {e}")
+            # Non-fatal - worktree_id will remain NULL for existing files
 
     def create_indexes(self) -> None:
         """Create database indexes for performance optimization."""

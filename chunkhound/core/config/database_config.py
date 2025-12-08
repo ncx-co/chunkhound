@@ -96,18 +96,24 @@ class DatabaseConfig(BaseModel):
         """Check if database is properly configured."""
         return self.path is not None
 
-    def resolve_worktree_db_path(self, base_directory: Path) -> Path:
-        """Resolve database path, using main worktree's database for linked worktrees.
+    def resolve_worktree_db_path(
+        self, base_directory: Path, worktree_enabled: bool = False
+    ) -> Path:
+        """Resolve database path, optionally using main worktree's database for linked worktrees.
 
-        For git worktrees, all worktrees share a single database located in the
-        main worktree's .chunkhound/db/ directory. This enables data sharing
-        between worktrees (unchanged files use main's chunks/embeddings).
+        When worktree support is enabled, all worktrees share a single database
+        located in the main worktree's .chunkhound/db/ directory. This enables
+        data sharing between worktrees (unchanged files use main's chunks/embeddings).
+
+        When worktree support is disabled (default), each directory gets its own
+        local database in .chunkhound/db/ - the original behavior.
 
         Args:
             base_directory: The directory being indexed (worktree root)
+            worktree_enabled: Whether worktree support is enabled in config
 
         Returns:
-            Path to the shared database directory
+            Path to the database directory
 
         Note:
             If self.path is already set (explicit config), it takes precedence.
@@ -116,6 +122,10 @@ class DatabaseConfig(BaseModel):
         # If explicit path configured, use it
         if self.path is not None:
             return self.path
+
+        # If worktree support disabled, always use local database (original behavior)
+        if not worktree_enabled:
+            return base_directory / ".chunkhound" / "db"
 
         from chunkhound.utils.worktree_detection import detect_worktree_info
 
