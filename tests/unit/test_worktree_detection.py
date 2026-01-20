@@ -151,7 +151,7 @@ class TestComputeChangedFilesViaGit:
 
     @patch('chunkhound.utils.worktree_detection.get_git_head_ref')
     @patch('subprocess.run')
-    @patch('chunkhound.utils.file_discovery.discover_files')
+    @patch('chunkhound.utils.file_patterns.discover_files')
     def test_compute_changes_success(
         self, mock_discover, mock_run, mock_get_ref, tmp_path
     ):
@@ -212,7 +212,7 @@ class TestFallbackComputeChangedFiles:
     """Tests for fallback_compute_changed_files function."""
 
     @patch('chunkhound.utils.hashing.compute_file_hash')
-    @patch('chunkhound.utils.file_discovery.discover_files')
+    @patch('chunkhound.utils.file_patterns.discover_files')
     def test_fallback_compute_changes(
         self, mock_discover, mock_hash, tmp_path
     ):
@@ -265,7 +265,7 @@ class TestFallbackComputeChangedFiles:
         assert changes['deleted'][0].name == "file3.py"
 
     @patch('chunkhound.utils.hashing.compute_file_hash')
-    @patch('chunkhound.utils.file_discovery.discover_files')
+    @patch('chunkhound.utils.file_patterns.discover_files')
     def test_fallback_hash_failure(self, mock_discover, mock_hash, tmp_path):
         """Test handling of hash computation failure."""
         main_wt = tmp_path / "main"

@@ -700,7 +700,7 @@ def duckdb_provider(tmp_path):
     config = DatabaseConfig(path=tmp_path, provider="duckdb")
     db_path = config.get_db_path()
 
-    provider = DuckDBProvider(str(db_path), base_directory=tmp_path)
+    provider = DuckDBProvider(str(db_path), base_directory=tmp_path, worktree_enabled=True)
     provider.connect()
 
     yield provider
@@ -719,7 +719,7 @@ def lancedb_provider(tmp_path):
     config = DatabaseConfig(path=tmp_path, provider="lancedb")
     db_path = config.get_db_path()
 
-    provider = LanceDBProvider(str(db_path), base_directory=tmp_path)
+    provider = LanceDBProvider(str(db_path), base_directory=tmp_path, worktree_enabled=True)
     provider.connect()
 
     yield provider
