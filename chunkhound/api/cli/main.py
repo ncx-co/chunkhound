@@ -57,6 +57,7 @@ def create_parser() -> argparse.ArgumentParser:
     from .parsers import create_main_parser, setup_subparsers
     from .parsers.calibrate_parser import add_calibrate_subparser
     from .parsers.mcp_parser import add_mcp_subparser
+    from .parsers.prune_parser import add_prune_subparser
     from .parsers.research_parser import add_research_subparser
     from .parsers.run_parser import add_run_subparser
     from .parsers.search_parser import add_search_subparser
@@ -69,6 +70,7 @@ def create_parser() -> argparse.ArgumentParser:
     add_mcp_subparser(subparsers)
     add_search_subparser(subparsers)
     add_research_subparser(subparsers)
+    add_prune_subparser(subparsers)
     # Diagnose command retired; functionality lives under: index --check-ignores
     add_calibrate_subparser(subparsers)
 
@@ -160,6 +162,23 @@ async def async_main() -> None:
             from .commands.calibrate import calibrate_command
 
             await calibrate_command(args, config)
+        elif args.command == "prune":
+            # Dynamic import to avoid early chunkhound module loading
+            from .commands.prune import (
+                prune_orphaned_command,
+                prune_worktree_command,
+                worktree_id_command,
+            )
+
+            if args.prune_command == "worktree":
+                await prune_worktree_command(args, config)
+            elif args.prune_command == "orphaned":
+                await prune_orphaned_command(args, config)
+            elif args.prune_command == "worktree-id":
+                await worktree_id_command(args, config)
+            else:
+                logger.error(f"Unknown prune subcommand: {args.prune_command}")
+                sys.exit(1)
         # 'diagnose' command retired; use: chunkhound index --check-ignores --vs git
         else:
             logger.error(f"Unknown command: {args.command}")

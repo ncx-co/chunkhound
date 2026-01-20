@@ -9,4 +9,7 @@ __all__ = [
     "search_command",
     "research_command",
     "calibrate_command",
+    "prune_worktree_command",
+    "prune_orphaned_command",
+    "worktree_id_command",
 ]
