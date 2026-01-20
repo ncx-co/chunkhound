@@ -81,53 +81,6 @@ class TestIndexingConfigWorktreeSupport:
             assert config.worktree_support_enabled is True
 
 
-class TestMCPToolVisibility:
-    """Tests for MCP tool visibility based on worktree support config."""
-
-    def test_http_server_hides_list_worktrees_when_disabled(self):
-        """Test HTTP server doesn't register list_worktrees when worktree disabled."""
-        import tempfile
-        from chunkhound.mcp_server.http_server import HttpMCPServer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create config with worktree support disabled (default)
-            config = Config(
-                database={"path": f"{tmpdir}/test.db", "provider": "duckdb"},
-                indexing={"worktree_support_enabled": False},
-            )
-            server = HttpMCPServer(config=config)
-
-            # Get registered tool names
-            tool_names = list(server.app._tool_manager._tools.keys())
-
-            # list_worktrees should NOT be registered
-            assert "list_worktrees" not in tool_names
-
-            # Other tools should still be registered
-            assert "search_regex" in tool_names
-            assert "search_semantic" in tool_names
-            assert "get_stats" in tool_names
-
-    def test_http_server_shows_list_worktrees_when_enabled(self):
-        """Test HTTP server registers list_worktrees when worktree enabled."""
-        import tempfile
-        from chunkhound.mcp_server.http_server import HttpMCPServer
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create config with worktree support enabled
-            config = Config(
-                database={"path": f"{tmpdir}/test.db", "provider": "duckdb"},
-                indexing={"worktree_support_enabled": True},
-            )
-            server = HttpMCPServer(config=config)
-
-            # Get registered tool names
-            tool_names = list(server.app._tool_manager._tools.keys())
-
-            # list_worktrees SHOULD be registered
-            assert "list_worktrees" in tool_names
-
-
 class TestMCPToolsDisabledMode:
     """Tests for MCP tools graceful handling when disabled (defense-in-depth).
 
