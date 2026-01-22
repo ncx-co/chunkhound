@@ -63,11 +63,11 @@ def _estimate_tokens_openai(text: str, model: str) -> int:
 
     try:
         encoding = tiktoken.encoding_for_model(model)
-        return len(encoding.encode(text))
+        return len(encoding.encode(text, disallowed_special=()))
     except KeyError:
         # Model not found, use default encoding
         encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 default
-        return len(encoding.encode(text))
+        return len(encoding.encode(text, disallowed_special=()))
 
 
 def _estimate_tokens_voyageai(text: str) -> int:
