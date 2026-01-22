@@ -189,9 +189,21 @@ class DuckDBProvider(SerialDatabaseProvider):
             # Call parent connect which handles executor initialization
             super().connect()
 
+            # After connection, run worktree migration if enabled
+            # This ensures existing files get migrated even if schema already exists
+            if self._worktree_enabled:
+                self._execute_in_db_thread_sync("migrate_worktree_support_with_stats")
+
         except Exception as e:
             logger.error(f"DuckDB connection failed: {e}")
             raise
+
+    def migrate_worktree_support(self) -> dict[str, Any]:
+        """Manually trigger worktree migration for existing files.
+
+        Returns dict with migration stats: files_migrated, worktree_id
+        """
+        return self._execute_in_db_thread_sync("migrate_worktree_support_with_stats")
 
     def _executor_connect(self, conn: Any, state: dict[str, Any]) -> None:
         """Executor method for connect - runs in DB thread.
@@ -559,7 +571,7 @@ class DuckDBProvider(SerialDatabaseProvider):
 
     def _executor_migrate_worktree_support(
         self, conn: Any, state: dict[str, Any]
-    ) -> None:
+    ) -> dict[str, Any]:
         """Migrate existing database to support worktrees when feature is enabled.
 
         This handles the case where:
@@ -570,9 +582,12 @@ class DuckDBProvider(SerialDatabaseProvider):
         Args:
             conn: Database connection
             state: Executor state dict
+
+        Returns:
+            Dict with migration stats: files_migrated, worktree_id
         """
         if not self._worktree_enabled:
-            return
+            return {"files_migrated": 0, "worktree_id": None}
 
         try:
             # Check if there are files with NULL worktree_id
@@ -582,7 +597,13 @@ class DuckDBProvider(SerialDatabaseProvider):
 
             files_without_worktree = result[0] if result else 0
             if files_without_worktree == 0:
-                return  # No migration needed
+                # No migration needed, but return current worktree info
+                from chunkhound.utils.worktree_detection import detect_worktree_info
+                worktree_info = detect_worktree_info(self._base_directory)
+                return {
+                    "files_migrated": 0,
+                    "worktree_id": worktree_info.worktree_id if worktree_info else None
+                }
 
             logger.info(
                 f"Migrating {files_without_worktree} files to worktree support"
@@ -598,7 +619,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                     "Could not determine worktree ID for base directory, "
                     "files will retain NULL worktree_id"
                 )
-                return
+                return {"files_migrated": 0, "worktree_id": None}
 
             # Update all files with NULL worktree_id to current worktree
             conn.execute(
@@ -630,9 +651,32 @@ class DuckDBProvider(SerialDatabaseProvider):
                 f"worktree '{worktree_info.worktree_id}'"
             )
 
+            return {
+                "files_migrated": files_without_worktree,
+                "worktree_id": worktree_info.worktree_id
+            }
+
         except Exception as e:
             logger.warning(f"Failed to migrate worktree support: {e}")
             # Non-fatal - worktree_id will remain NULL for existing files
+            return {"files_migrated": 0, "worktree_id": None, "error": str(e)}
+
+    def _executor_migrate_worktree_support_with_stats(
+        self, conn: Any, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Executor method wrapper that returns migration stats.
+
+        This is called via _execute_in_db_thread_sync to trigger migration
+        on database connect and return statistics.
+
+        Args:
+            conn: Database connection
+            state: Executor state dict
+
+        Returns:
+            Dict with migration stats: files_migrated, worktree_id
+        """
+        return self._executor_migrate_worktree_support(conn, state)
 
     def _executor_migrate_schema(self, conn: Any, state: dict[str, Any]) -> None:
         """Executor method for schema migrations - runs in DB thread."""
