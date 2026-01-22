@@ -32,6 +32,7 @@ class File:
         language: Programming language of the file
         size_bytes: File size in bytes
         content_hash: Fast checksum for change detection (None if not computed)
+        worktree_id: Worktree identifier for git worktree support (None if not in worktree)
         created_at: When the file was first indexed
         updated_at: When the file record was last updated
     """
@@ -42,6 +43,7 @@ class File:
     size_bytes: int
     id: FileId | None = None
     content_hash: str | None = None
+    worktree_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -184,6 +186,7 @@ class File:
                 updated_at = datetime.fromisoformat(updated_at)
 
             content_hash = data.get("content_hash")
+            worktree_id = data.get("worktree_id")
 
             return cls(
                 id=file_id,
@@ -192,6 +195,7 @@ class File:
                 language=language,
                 size_bytes=int(size_bytes),
                 content_hash=content_hash,
+                worktree_id=worktree_id,
                 created_at=created_at,
                 updated_at=updated_at,
             )
@@ -220,6 +224,9 @@ class File:
 
         if self.content_hash is not None:
             result["content_hash"] = self.content_hash
+
+        if self.worktree_id is not None:
+            result["worktree_id"] = self.worktree_id
 
         if self.created_at is not None:
             result["created_at"] = self.created_at.isoformat()
@@ -278,6 +285,7 @@ class File:
             language=self.language,
             size_bytes=self.size_bytes,
             content_hash=self.content_hash,
+            worktree_id=self.worktree_id,
             created_at=self.created_at,
             updated_at=self.updated_at,
         )
@@ -298,6 +306,7 @@ class File:
             language=self.language,
             size_bytes=self.size_bytes,
             content_hash=self.content_hash,
+            worktree_id=self.worktree_id,
             created_at=self.created_at,
             updated_at=datetime.utcnow(),
         )

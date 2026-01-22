@@ -1799,6 +1799,7 @@ class IndexingCoordinator(BaseService):
             mtime=file_stat.st_mtime,
             language=language,
             content_hash=content_hash,
+            worktree_id=self._current_worktree_id,
         )
         return self._db.insert_file(file_model)
 

@@ -1148,6 +1148,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                     file.size_bytes if hasattr(file, "size_bytes") else None,
                     file.mtime if hasattr(file, "mtime") else None,
                     getattr(file, "content_hash", None),
+                    getattr(file, "worktree_id", None),
                 )
                 return file_id
 
@@ -1157,8 +1158,8 @@ class DuckDBProvider(SerialDatabaseProvider):
             # No existing file, insert new one
             result = conn.execute(
                 """
-                INSERT INTO files (path, name, extension, size, modified_time, content_hash, language)
-                VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?)
+                INSERT INTO files (path, name, extension, size, modified_time, content_hash, language, worktree_id)
+                VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?, ?)
                 RETURNING id
             """,
                 [
@@ -1171,6 +1172,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                     file.mtime if hasattr(file, "mtime") else None,
                     getattr(file, "content_hash", None),
                     file.language.value if file.language else None,
+                    getattr(file, "worktree_id", None),
                 ],
             )
 
@@ -1271,10 +1273,11 @@ class DuckDBProvider(SerialDatabaseProvider):
         size_bytes: int | None = None,
         mtime: float | None = None,
         content_hash: str | None = None,
+        worktree_id: str | None = None,
         **kwargs,
     ) -> None:
         """Update file record with new values - delegate to file repository."""
-        self._execute_in_db_thread_sync("update_file", file_id, size_bytes, mtime, content_hash)
+        self._execute_in_db_thread_sync("update_file", file_id, size_bytes, mtime, content_hash, worktree_id)
 
     def _executor_update_file(
         self,
@@ -1284,6 +1287,7 @@ class DuckDBProvider(SerialDatabaseProvider):
         size_bytes: int | None,
         mtime: float | None,
         content_hash: str | None,
+        worktree_id: str | None = None,
     ) -> None:
         """Executor method for update_file - runs in DB thread."""
         # Track operation for checkpoint management
@@ -1304,6 +1308,10 @@ class DuckDBProvider(SerialDatabaseProvider):
         if content_hash is not None:
             updates.append("content_hash = ?")
             params.append(content_hash)
+
+        if worktree_id is not None:
+            updates.append("worktree_id = ?")
+            params.append(worktree_id)
 
         if updates:
             updates.append("updated_at = CURRENT_TIMESTAMP")
