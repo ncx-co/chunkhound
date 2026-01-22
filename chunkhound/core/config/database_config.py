@@ -69,7 +69,7 @@ class DatabaseConfig(BaseModel):
 
         Returns the final path used by the provider, including all
         provider-specific transformations:
-        - DuckDB: path/chunks.db (file) or :memory: for in-memory
+        - DuckDB: path (flat file) or :memory: for in-memory
         - LanceDB: path/lancedb.lancedb/ (directory with .lancedb suffix)
 
         This is the authoritative source for database location checks.
@@ -79,15 +79,20 @@ class DatabaseConfig(BaseModel):
 
         # Skip directory creation for in-memory databases (":memory:" is invalid on Windows)
         is_memory = str(self.path) == ":memory:"
-        if not is_memory:
-            self.path.mkdir(parents=True, exist_ok=True)
 
         if self.provider == "duckdb":
-            return self.path if is_memory else self.path / "chunks.db"
+            # DuckDB: Use flat file (original behavior)
+            # Create parent directory if needed (but not the db file itself as a directory)
+            if not is_memory:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            return self.path
         elif self.provider == "lancedb":
+            # LanceDB: Use directory structure
+            # Create parent directory for LanceDB
+            lancedb_base = self.path / "lancedb"
+            lancedb_base.parent.mkdir(parents=True, exist_ok=True)
             # LanceDB adds .lancedb suffix to prevent naming collisions
             # and clarify storage structure (see lancedb_provider.py:111-113)
-            lancedb_base = self.path / "lancedb"
             return lancedb_base.parent / f"{lancedb_base.stem}.lancedb"
         else:
             raise ValueError(f"Unknown database provider: {self.provider}")
