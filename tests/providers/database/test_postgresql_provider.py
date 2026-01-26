@@ -266,6 +266,239 @@ def test_indexes_creation(provider):
     assert any("chunks_file_id" in name for name in index_names)
 
 
+def test_embedding_operations(provider, tmp_path):
+    """Test embedding insert and retrieval."""
+    # First create a file and chunk
+    test_file = File(
+        path=str(tmp_path / "test.py"),
+        mtime=1234567890.0,
+        size_bytes=100,
+        language=Language.PYTHON,
+    )
+    file_id = provider.insert_file(test_file)
+
+    test_chunk = Chunk(
+        file_id=file_id,
+        chunk_type=ChunkType.FUNCTION,
+        symbol="test_function",
+        code="def test_function():\n    pass",
+        start_line=1,
+        end_line=2,
+        start_byte=0,
+        end_byte=30,
+        language=Language.PYTHON,
+    )
+    chunk_id = provider.insert_chunk(test_chunk)
+
+    # Insert embedding
+    test_embedding = [0.1] * 1536  # 1536 dimensions
+    provider.insert_embedding(chunk_id, test_embedding, "openai", "text-embedding-ada-002")
+
+    # Retrieve embedding
+    retrieved = provider.get_embedding(chunk_id, "openai", "text-embedding-ada-002")
+    assert retrieved is not None
+    assert len(retrieved["embedding"]) == 1536
+    assert retrieved["provider"] == "openai"
+    assert retrieved["model"] == "text-embedding-ada-002"
+
+
+def test_batch_embedding_insert(provider, tmp_path):
+    """Test batch embedding insert with index optimization."""
+    # First create a file and chunks
+    test_file = File(
+        path=str(tmp_path / "test.py"),
+        mtime=1234567890.0,
+        size_bytes=1000,
+        language=Language.PYTHON,
+    )
+    file_id = provider.insert_file(test_file)
+
+    # Create 60 chunks to test index optimization (50+ threshold)
+    chunks = [
+        Chunk(
+            file_id=file_id,
+            chunk_type=ChunkType.FUNCTION,
+            symbol=f"test_function_{i}",
+            code=f"def test_function_{i}():\n    pass",
+            start_line=i * 3,
+            end_line=i * 3 + 2,
+            start_byte=i * 30,
+            end_byte=i * 30 + 30,
+            language=Language.PYTHON,
+        )
+        for i in range(60)
+    ]
+
+    chunk_ids = provider.insert_chunks_batch(chunks)
+    assert len(chunk_ids) == 60
+
+    # Create embeddings for all chunks
+    embeddings_data = [
+        (chunk_id, [0.1] * 1536, "openai", "text-embedding-ada-002")
+        for chunk_id in chunk_ids
+    ]
+
+    # Insert embeddings in batch (should trigger index optimization)
+    provider.insert_embeddings_batch(embeddings_data)
+
+    # Verify all embeddings were inserted
+    for chunk_id in chunk_ids:
+        retrieved = provider.get_embedding(chunk_id, "openai", "text-embedding-ada-002")
+        assert retrieved is not None
+
+
+def test_worktree_isolation(provider, tmp_path):
+    """Test worktree ID isolation for files."""
+    # Create two files with same path but different worktree IDs
+    test_file_1 = File(
+        path=str(tmp_path / "test.py"),
+        mtime=1234567890.0,
+        size_bytes=100,
+        language=Language.PYTHON,
+    )
+
+    # Insert file with worktree_id_1
+    file_id_1 = provider.insert_file(test_file_1, worktree_id="worktree_1")
+    assert file_id_1 > 0
+
+    # Insert file with same path but different worktree_id
+    test_file_2 = File(
+        path=str(tmp_path / "test.py"),
+        mtime=1234567890.0,
+        size_bytes=200,
+        language=Language.PYTHON,
+    )
+    file_id_2 = provider.insert_file(test_file_2, worktree_id="worktree_2")
+    assert file_id_2 > 0
+
+    # File IDs should be different due to worktree isolation
+    assert file_id_1 != file_id_2
+
+    # Retrieve files by path with worktree_id
+    retrieved_1 = provider.get_file_by_path(
+        str(tmp_path / "test.py"), worktree_id="worktree_1"
+    )
+    assert retrieved_1 is not None
+    assert retrieved_1["id"] == file_id_1
+
+    retrieved_2 = provider.get_file_by_path(
+        str(tmp_path / "test.py"), worktree_id="worktree_2"
+    )
+    assert retrieved_2 is not None
+    assert retrieved_2["id"] == file_id_2
+
+
+def test_connection_configuration():
+    """Test connection string construction from DatabaseConfig."""
+    from chunkhound.core.config.database_config import DatabaseConfig
+
+    # Test with individual fields
+    config = DatabaseConfig(
+        provider="postgresql",
+        postgresql_host="testhost",
+        postgresql_port=5433,
+        postgresql_database="testdb",
+        postgresql_user="testuser",
+        postgresql_password="testpass",
+    )
+
+    conn_str = config.get_postgresql_connection_string()
+    assert conn_str == "postgresql://testuser:testpass@testhost:5433/testdb"
+
+    # Test with connection string override
+    config_override = DatabaseConfig(
+        provider="postgresql",
+        postgresql_connection_string="postgresql://override:pass@overridehost/overridedb",
+    )
+
+    conn_str_override = config_override.get_postgresql_connection_string()
+    assert conn_str_override == "postgresql://override:pass@overridehost/overridedb"
+
+
+def test_vector_search(provider, tmp_path):
+    """Test vector similarity search."""
+    # Create a file and chunk
+    test_file = File(
+        path=str(tmp_path / "test.py"),
+        mtime=1234567890.0,
+        size_bytes=100,
+        language=Language.PYTHON,
+    )
+    file_id = provider.insert_file(test_file)
+
+    test_chunk = Chunk(
+        file_id=file_id,
+        chunk_type=ChunkType.FUNCTION,
+        symbol="test_function",
+        code="def test_function():\n    pass",
+        start_line=1,
+        end_line=2,
+        start_byte=0,
+        end_byte=30,
+        language=Language.PYTHON,
+    )
+    chunk_id = provider.insert_chunk(test_chunk)
+
+    # Insert embedding
+    test_embedding = [0.1] * 1536
+    provider.insert_embedding(chunk_id, test_embedding, "openai", "text-embedding-ada-002")
+
+    # Search with similar vector
+    query_vector = [0.1] * 1536
+    results = provider.search_similar_embeddings(
+        query_vector, "openai", "text-embedding-ada-002", limit=10
+    )
+
+    assert len(results) > 0
+    assert results[0]["chunk_id"] == chunk_id
+    assert "similarity" in results[0]
+
+
+def test_multiple_embedding_dimensions(provider, tmp_path):
+    """Test handling multiple embedding dimensions."""
+    # Create a file and chunk
+    test_file = File(
+        path=str(tmp_path / "test.py"),
+        mtime=1234567890.0,
+        size_bytes=100,
+        language=Language.PYTHON,
+    )
+    file_id = provider.insert_file(test_file)
+
+    test_chunk = Chunk(
+        file_id=file_id,
+        chunk_type=ChunkType.FUNCTION,
+        symbol="test_function",
+        code="def test_function():\n    pass",
+        start_line=1,
+        end_line=2,
+        start_byte=0,
+        end_byte=30,
+        language=Language.PYTHON,
+    )
+    chunk_id = provider.insert_chunk(test_chunk)
+
+    # Insert embeddings with different dimensions
+    embedding_768 = [0.1] * 768
+    embedding_384 = [0.2] * 384
+
+    provider.insert_embedding(chunk_id, embedding_768, "provider1", "model-768")
+    provider.insert_embedding(chunk_id, embedding_384, "provider2", "model-384")
+
+    # Verify both embedding tables were created
+    assert provider._table_exists("embeddings_768")
+    assert provider._table_exists("embeddings_384")
+
+    # Retrieve both embeddings
+    retrieved_768 = provider.get_embedding(chunk_id, "provider1", "model-768")
+    assert retrieved_768 is not None
+    assert len(retrieved_768["embedding"]) == 768
+
+    retrieved_384 = provider.get_embedding(chunk_id, "provider2", "model-384")
+    assert retrieved_384 is not None
+    assert len(retrieved_384["embedding"]) == 384
+
+
 if __name__ == "__main__":
     # Allow running tests directly
     pytest.main([__file__, "-v"])
