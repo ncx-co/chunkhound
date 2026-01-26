@@ -306,6 +306,21 @@ class ProviderRegistry:
                 embedding_manager=embedding_manager,
                 config=self._config.database
             )
+        elif provider_type == "postgresql":
+            from chunkhound.providers.database.postgresql_provider import PostgreSQLProvider
+
+            # Get connection string from config
+            connection_string = self._config.database.get_postgresql_connection_string()
+
+            # Get embedding_manager if available for dimension detection
+            embedding_manager = getattr(self, '_embedding_manager', None)
+
+            provider = PostgreSQLProvider(
+                connection_string,
+                base_directory,
+                embedding_manager=embedding_manager,
+                config=self._config.database
+            )
         else:
             logger.warning(f"Unknown provider {provider_type}, defaulting to DuckDB")
             from chunkhound.providers.database.duckdb_provider import DuckDBProvider

@@ -92,8 +92,12 @@ dev = [
 ]
 test = [
     "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0", 
+    "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.1.0",
+]
+postgresql = [
+    "asyncpg>=0.29.0",
+    "pgvector>=0.3.0",
 ]
 
 [project.scripts]

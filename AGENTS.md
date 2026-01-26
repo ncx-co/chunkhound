@@ -78,6 +78,66 @@ uv publish
 - Waiting for upstream HDBSCAN fix
 - Will break in sklearn 1.8 if not fixed upstream
 
+## DATABASE_PROVIDERS
+ChunkHound supports multiple database backends for flexibility and deployment scenarios.
+
+### Supported Providers
+- **DuckDB** (default): Single-file analytical database, optimal for local development
+- **LanceDB**: Serverless vector database with native MVCC support
+- **PostgreSQL**: Production-ready RDBMS with pgvector for vector similarity
+
+### PostgreSQL Provider
+**Status**: Available (added in v4.1.0)
+**Dependencies**: `asyncpg>=0.29.0`, `pgvector>=0.3.0`
+
+**Configuration**:
+```bash
+# Using connection string (recommended)
+export CHUNKHOUND_DATABASE__PROVIDER=postgresql
+export CHUNKHOUND_DATABASE__POSTGRESQL_CONNECTION_STRING="postgresql://user:pass@localhost/chunkhound"
+
+# Using individual fields
+export CHUNKHOUND_DATABASE__POSTGRESQL_HOST=localhost
+export CHUNKHOUND_DATABASE__POSTGRESQL_PORT=5432
+export CHUNKHOUND_DATABASE__POSTGRESQL_DATABASE=chunkhound
+export CHUNKHOUND_DATABASE__POSTGRESQL_USER=postgres
+export CHUNKHOUND_DATABASE__POSTGRESQL_PASSWORD=postgres
+export CHUNKHOUND_DATABASE__POSTGRESQL_POOL_SIZE=5
+```
+
+**Setup**:
+```bash
+# Install PostgreSQL with pgvector
+brew install postgresql pgvector
+
+# Create database
+createdb chunkhound
+psql chunkhound -c "CREATE EXTENSION vector;"
+
+# Run ChunkHound
+uv run chunkhound index /path/to/code
+```
+
+**Architecture**:
+- Extends `SerialDatabaseProvider` for single-threaded database access
+- Uses asyncpg connection pooling with sync wrappers
+- pgvector extension for vector similarity search (ivfflat indexes)
+- Batch optimizations: drop/recreate indexes for bulk inserts (50+ embeddings)
+- Worktree isolation via `worktree_id` field
+
+**Performance**:
+- Connection pooling reduces overhead for concurrent operations
+- ivfflat indexes provide efficient approximate nearest neighbor search
+- Batch operations optimized for PostgreSQL's COPY protocol
+
+### Provider Constraints
+**CRITICAL**: All providers inherit from `SerialDatabaseProvider`
+- Single-threaded database access (enforced via SerialDatabaseExecutor)
+- No concurrent database operations
+- File parsing is parallelized, storage remains single-threaded
+- Prevents corruption in databases requiring exclusive access (DuckDB)
+- PostgreSQL handles multi-process safety via MVCC (ChunkHound still serializes per-process)
+
 ## PROJECT_MAINTENANCE
 - Smoke tests are mandatory guardrails
 - Run `uv run mypy chunkhound` during reviews to catch Optional/type boundary issues

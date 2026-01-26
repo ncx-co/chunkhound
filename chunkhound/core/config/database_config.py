@@ -26,7 +26,7 @@ class DatabaseConfig(BaseModel):
     path: Path | None = Field(default=None, description="Path to database directory")
 
     # Provider selection
-    provider: Literal["duckdb", "lancedb"] = Field(
+    provider: Literal["duckdb", "lancedb", "postgresql"] = Field(
         default="duckdb", description="Database provider to use"
     )
 
@@ -40,6 +40,38 @@ class DatabaseConfig(BaseModel):
         default=100,
         ge=0,
         description="Minimum fragment count to trigger optimization (0 = always optimize, 50 = aggressive, 100 = balanced, 500 = conservative)",
+    )
+
+    # PostgreSQL-specific settings
+    postgresql_host: str | None = Field(
+        default=None,
+        description="PostgreSQL host (default: localhost)",
+    )
+    postgresql_port: int | None = Field(
+        default=None,
+        description="PostgreSQL port (default: 5432)",
+    )
+    postgresql_database: str | None = Field(
+        default=None,
+        description="PostgreSQL database name",
+    )
+    postgresql_user: str | None = Field(
+        default=None,
+        description="PostgreSQL username",
+    )
+    postgresql_password: str | None = Field(
+        default=None,
+        description="PostgreSQL password",
+    )
+    postgresql_connection_string: str | None = Field(
+        default=None,
+        description="PostgreSQL connection string (overrides individual fields if provided)",
+    )
+    postgresql_pool_size: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="PostgreSQL connection pool size",
     )
 
     # Disk usage limits
@@ -59,7 +91,7 @@ class DatabaseConfig(BaseModel):
     @field_validator("provider")
     def validate_provider(cls, v: str) -> str:
         """Validate database provider selection."""
-        valid_providers = ["duckdb", "lancedb"]
+        valid_providers = ["duckdb", "lancedb", "postgresql"]
         if v not in valid_providers:
             raise ValueError(f"Invalid provider: {v}. Must be one of {valid_providers}")
         return v
@@ -107,8 +139,47 @@ class DatabaseConfig(BaseModel):
         else:
             raise ValueError(f"Unknown database provider: {self.provider}")
 
+    def get_postgresql_connection_string(self) -> str:
+        """Build PostgreSQL connection string from configuration.
+
+        Returns:
+            Connection string for PostgreSQL
+
+        Raises:
+            ValueError: If PostgreSQL configuration is incomplete
+        """
+        # If explicit connection string provided, use it
+        if self.postgresql_connection_string:
+            return self.postgresql_connection_string
+
+        # Build from individual fields
+        host = self.postgresql_host or "localhost"
+        port = self.postgresql_port or 5432
+        database = self.postgresql_database
+        user = self.postgresql_user
+        password = self.postgresql_password
+
+        if not database:
+            raise ValueError("PostgreSQL database name is required")
+        if not user:
+            raise ValueError("PostgreSQL username is required")
+
+        # Build connection string
+        conn_str = f"postgresql://{user}"
+        if password:
+            conn_str += f":{password}"
+        conn_str += f"@{host}:{port}/{database}"
+
+        return conn_str
+
     def is_configured(self) -> bool:
         """Check if database is properly configured."""
+        if self.provider == "postgresql":
+            # For PostgreSQL, check if connection string or required fields are set
+            return bool(
+                self.postgresql_connection_string
+                or (self.postgresql_database and self.postgresql_user)
+            )
         return self.path is not None
 
     @classmethod
@@ -126,8 +197,14 @@ class DatabaseConfig(BaseModel):
 
         parser.add_argument(
             "--database-provider",
-            choices=["duckdb", "lancedb"],
+            choices=["duckdb", "lancedb", "postgresql"],
             help="Database provider to use",
+        )
+
+        parser.add_argument(
+            "--postgresql-connection-string",
+            type=str,
+            help="PostgreSQL connection string (overrides individual PostgreSQL settings)",
         )
 
         parser.add_argument(
@@ -158,6 +235,21 @@ class DatabaseConfig(BaseModel):
             except ValueError:
                 # Invalid value - silently ignore
                 pass
+        # PostgreSQL configuration from environment
+        if pg_conn_str := os.getenv("CHUNKHOUND_DATABASE__POSTGRESQL_CONNECTION_STRING"):
+            config["postgresql_connection_string"] = pg_conn_str
+        if pg_host := os.getenv("CHUNKHOUND_DATABASE__POSTGRESQL_HOST"):
+            config["postgresql_host"] = pg_host
+        if pg_port := os.getenv("CHUNKHOUND_DATABASE__POSTGRESQL_PORT"):
+            config["postgresql_port"] = int(pg_port)
+        if pg_db := os.getenv("CHUNKHOUND_DATABASE__POSTGRESQL_DATABASE"):
+            config["postgresql_database"] = pg_db
+        if pg_user := os.getenv("CHUNKHOUND_DATABASE__POSTGRESQL_USER"):
+            config["postgresql_user"] = pg_user
+        if pg_pass := os.getenv("CHUNKHOUND_DATABASE__POSTGRESQL_PASSWORD"):
+            config["postgresql_password"] = pg_pass
+        if pg_pool := os.getenv("CHUNKHOUND_DATABASE__POSTGRESQL_POOL_SIZE"):
+            config["postgresql_pool_size"] = int(pg_pool)
         return config
 
     @classmethod
