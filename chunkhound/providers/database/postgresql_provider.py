@@ -579,9 +579,45 @@ class PostgreSQLProvider(SerialDatabaseProvider):
         return self._chunk_repository.get_chunk_by_id(chunk_id, as_model)
 
     # Embedding operations delegate to embedding_repository
-    def insert_embedding(self, embedding: Embedding) -> int:
-        """Insert embedding record."""
-        return self._embedding_repository.insert_embedding(embedding)
+    def insert_embedding(
+        self,
+        chunk_id_or_embedding: int | Embedding,
+        vector: list[float] | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> int:
+        """Insert embedding record.
+
+        Supports two calling conventions:
+        1. New style: insert_embedding(Embedding(...))
+        2. Legacy style: insert_embedding(chunk_id, vector, provider, model)
+
+        Args:
+            chunk_id_or_embedding: Either an Embedding object or chunk_id (int)
+            vector: Embedding vector (required if first arg is int)
+            provider: Provider name (required if first arg is int)
+            model: Model name (required if first arg is int)
+
+        Returns:
+            Embedding ID
+        """
+        if isinstance(chunk_id_or_embedding, Embedding):
+            # New style: Embedding object
+            return self._embedding_repository.insert_embedding(chunk_id_or_embedding)
+        else:
+            # Legacy style: separate parameters
+            if vector is None or provider is None or model is None:
+                raise ValueError(
+                    "When calling with chunk_id, vector, provider, and model are required"
+                )
+            embedding = Embedding(
+                chunk_id=chunk_id_or_embedding,
+                vector=vector,
+                provider=provider,
+                model=model,
+                dims=len(vector),
+            )
+            return self._embedding_repository.insert_embedding(embedding)
 
     def insert_embeddings_batch(
         self, embeddings_data: list[dict], batch_size: int | None = None
@@ -598,3 +634,336 @@ class PostgreSQLProvider(SerialDatabaseProvider):
         return self._embedding_repository.get_embedding_by_chunk_id(
             chunk_id, provider, model
         )
+
+    # Compatibility methods for tests
+    def get_embedding(
+        self, chunk_id: int, provider: str, model: str
+    ) -> dict[str, Any] | None:
+        """Get embedding for specific chunk (test compatibility method).
+
+        Args:
+            chunk_id: Chunk ID to get embedding for
+            provider: Embedding provider name
+            model: Embedding model name
+
+        Returns:
+            Dictionary with embedding data or None
+        """
+        embedding = self.get_embedding_by_chunk_id(chunk_id, provider, model)
+        if embedding:
+            return {
+                "chunk_id": embedding.chunk_id,
+                "provider": embedding.provider,
+                "model": embedding.model,
+                "embedding": embedding.vector,
+                "dims": embedding.dims,
+            }
+        return None
+
+    # Executor methods for database thread operations
+    # These are called by SerialDatabaseExecutor via _execute_in_db_thread_sync
+
+    def _executor_insert_file(
+        self, conn: Any, state: dict[str, Any], file: File, worktree_id: str | None = None
+    ) -> int:
+        """Executor method for insert_file - runs in DB thread."""
+        from chunkhound.core.utils import normalize_path_for_lookup
+
+        # Normalize path for storage
+        base_dir = state.get("base_directory")
+        normalized_path = normalize_path_for_lookup(str(file.path), base_dir)
+
+        # Insert new file record
+        result = conn.fetchval_sync(
+            """
+            INSERT INTO files (path, name, extension, size, modified_time, language, worktree_id)
+            VALUES ($1, $2, $3, $4, TO_TIMESTAMP($5), $6, $7)
+            RETURNING id
+            """,
+            normalized_path,
+            file.name,
+            file.extension,
+            file.size_bytes,
+            file.mtime,
+            file.language.value if file.language else None,
+            worktree_id,
+        )
+        return result
+
+    def _executor_get_file_by_path(
+        self, conn: Any, state: dict[str, Any], path: str, worktree_id: str | None, as_model: bool
+    ) -> dict[str, Any] | File | None:
+        """Executor method for get_file_by_path - runs in DB thread."""
+        from chunkhound.core.utils import normalize_path_for_lookup
+        from chunkhound.core.types.common import Language
+
+        base_dir = state.get("base_directory")
+        lookup_path = normalize_path_for_lookup(path, base_dir)
+
+        if worktree_id:
+            result = conn.fetch_sync(
+                """
+                SELECT id, path, name, extension, size, modified_time, language,
+                       created_at, updated_at, worktree_id
+                FROM files
+                WHERE path = $1 AND worktree_id = $2
+                """,
+                lookup_path,
+                worktree_id,
+            )
+        else:
+            result = conn.fetch_sync(
+                """
+                SELECT id, path, name, extension, size, modified_time, language,
+                       created_at, updated_at, worktree_id
+                FROM files
+                WHERE path = $1 AND worktree_id IS NULL
+                """,
+                lookup_path,
+            )
+
+        if not result or len(result) == 0:
+            return None
+
+        row = result[0]
+        file_dict = {
+            "id": row["id"],
+            "path": row["path"],
+            "name": row["name"],
+            "extension": row["extension"],
+            "size": row["size"],
+            "modified_time": row["modified_time"],
+            "language": row["language"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+        if as_model:
+            return File(
+                path=row["path"],
+                mtime=row["modified_time"].timestamp() if row["modified_time"] else 0,
+                size_bytes=row["size"],
+                language=Language(row["language"]) if row["language"] else Language.UNKNOWN,
+            )
+
+        return file_dict
+
+    def _executor_get_file_by_id_query(
+        self, conn: Any, state: dict[str, Any], file_id: int, as_model: bool
+    ) -> dict[str, Any] | File | None:
+        """Executor method for get_file_by_id - runs in DB thread."""
+        from chunkhound.core.types.common import Language
+
+        result = conn.fetch_sync(
+            """
+            SELECT id, path, name, extension, size, modified_time, language,
+                   created_at, updated_at, worktree_id
+            FROM files
+            WHERE id = $1
+            """,
+            file_id,
+        )
+
+        if not result or len(result) == 0:
+            return None
+
+        row = result[0]
+        file_dict = {
+            "id": row["id"],
+            "path": row["path"],
+            "name": row["name"],
+            "extension": row["extension"],
+            "size": row["size"],
+            "modified_time": row["modified_time"],
+            "language": row["language"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+        if as_model:
+            return File(
+                path=row["path"],
+                mtime=row["modified_time"].timestamp() if row["modified_time"] else 0,
+                size_bytes=row["size"],
+                language=Language(row["language"]) if row["language"] else Language.UNKNOWN,
+            )
+
+        return file_dict
+
+    def _executor_update_file(
+        self,
+        conn: Any,
+        state: dict[str, Any],
+        file_id: int,
+        size_bytes: int | None,
+        mtime: float | None,
+        content_hash: str | None,
+    ) -> None:
+        """Executor method for update_file - runs in DB thread."""
+        # Build dynamic update query
+        set_clauses = []
+        params = []
+        param_num = 1
+
+        if size_bytes is not None:
+            set_clauses.append(f"size = ${param_num}")
+            params.append(size_bytes)
+            param_num += 1
+
+        if mtime is not None:
+            set_clauses.append(f"modified_time = TO_TIMESTAMP(${param_num})")
+            params.append(mtime)
+            param_num += 1
+
+        if content_hash is not None:
+            set_clauses.append(f"content_hash = ${param_num}")
+            params.append(content_hash)
+            param_num += 1
+
+        if set_clauses:
+            set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+            params.append(file_id)
+
+            query = f"UPDATE files SET {', '.join(set_clauses)} WHERE id = ${param_num}"
+            conn.execute_sync(query, *params)
+
+    def _executor_insert_chunk_single(
+        self, conn: Any, state: dict[str, Any], chunk: Chunk
+    ) -> int:
+        """Executor method for insert_chunk - runs in DB thread."""
+        import json
+
+        metadata_json = json.dumps(chunk.metadata) if chunk.metadata else None
+
+        result = conn.fetchval_sync(
+            """
+            INSERT INTO chunks (file_id, chunk_type, symbol, code, start_line, end_line,
+                              start_byte, end_byte, language, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id
+            """,
+            chunk.file_id,
+            chunk.chunk_type.value if hasattr(chunk.chunk_type, 'value') else chunk.chunk_type,
+            chunk.symbol,
+            chunk.code,
+            chunk.start_line,
+            chunk.end_line,
+            chunk.start_byte,
+            chunk.end_byte,
+            chunk.language.value if hasattr(chunk.language, 'value') else chunk.language,
+            metadata_json,
+        )
+        return result
+
+    def _executor_insert_chunks_batch(
+        self, conn: Any, state: dict[str, Any], chunks: list[Chunk]
+    ) -> list[int]:
+        """Executor method for insert_chunks_batch - runs in DB thread."""
+        if not chunks:
+            return []
+
+        import json
+
+        # Prepare data for bulk insert
+        placeholders = []
+        params = []
+        for i, chunk in enumerate(chunks):
+            base = i * 10
+            placeholders.append(
+                f"(${base+1}, ${base+2}, ${base+3}, ${base+4}, ${base+5}, ${base+6}, "
+                f"${base+7}, ${base+8}, ${base+9}, ${base+10})"
+            )
+            metadata_json = json.dumps(chunk.metadata) if chunk.metadata else None
+            params.extend([
+                chunk.file_id,
+                chunk.chunk_type.value if hasattr(chunk.chunk_type, 'value') else chunk.chunk_type,
+                chunk.symbol,
+                chunk.code,
+                chunk.start_line,
+                chunk.end_line,
+                chunk.start_byte,
+                chunk.end_byte,
+                chunk.language.value if hasattr(chunk.language, 'value') else chunk.language,
+                metadata_json,
+            ])
+
+        # Single INSERT statement for all chunks
+        query = f"""
+            INSERT INTO chunks (file_id, chunk_type, symbol, code, start_line, end_line,
+                              start_byte, end_byte, language, metadata)
+            VALUES {', '.join(placeholders)}
+            RETURNING id
+        """
+
+        results = conn.fetch_sync(query, *params)
+        return [row["id"] for row in results]
+
+    def _executor_get_chunk_by_id_query(
+        self, conn: Any, state: dict[str, Any], chunk_id: int
+    ) -> Any:
+        """Executor method for get_chunk_by_id query - runs in DB thread."""
+        return conn.fetch_sync(
+            """
+            SELECT id, file_id, chunk_type, symbol, code, start_line, end_line,
+                   start_byte, end_byte, language, created_at, updated_at, metadata
+            FROM chunks WHERE id = $1
+            """,
+            chunk_id,
+        )
+
+    def _executor_get_chunks_by_file_id_query(
+        self, conn: Any, state: dict[str, Any], file_id: int
+    ) -> Any:
+        """Executor method for get_chunks_by_file_id query - runs in DB thread."""
+        return conn.fetch_sync(
+            """
+            SELECT id, file_id, chunk_type, symbol, code, start_line, end_line,
+                   start_byte, end_byte, language, created_at, updated_at, metadata
+            FROM chunks WHERE file_id = $1
+            """,
+            file_id,
+        )
+
+    def _executor_delete_file_chunks(
+        self, conn: Any, state: dict[str, Any], file_id: int
+    ) -> None:
+        """Executor method for delete_file_chunks - runs in DB thread."""
+        conn.execute_sync("DELETE FROM chunks WHERE file_id = $1", file_id)
+
+    def _executor_delete_chunk(
+        self, conn: Any, state: dict[str, Any], chunk_id: int
+    ) -> None:
+        """Executor method for delete_chunk - runs in DB thread."""
+        conn.execute_sync("DELETE FROM chunks WHERE id = $1", chunk_id)
+
+    def _executor_update_chunk_query(
+        self, conn: Any, state: dict[str, Any], chunk_id: int, query: str, params: list
+    ) -> None:
+        """Executor method for update_chunk query - runs in DB thread."""
+        conn.execute_sync(query, *params)
+
+    def _executor_get_chunks_in_range_query(
+        self, conn: Any, state: dict[str, Any], file_id: int, start_line: int, end_line: int
+    ) -> Any:
+        """Executor method for get_chunks_in_range query - runs in DB thread."""
+        return conn.fetch_sync(
+            """
+            SELECT id, file_id, chunk_type, symbol, code, start_line, end_line,
+                   start_byte, end_byte, language, created_at, updated_at, metadata
+            FROM chunks
+            WHERE file_id = $1
+              AND ((start_line >= $2 AND start_line <= $3)
+                   OR (end_line >= $2 AND end_line <= $3)
+                   OR (start_line <= $2 AND end_line >= $3))
+            ORDER BY start_line
+            """,
+            file_id,
+            start_line,
+            end_line,
+        )
+
+    def _executor_get_all_chunks_with_metadata_query(
+        self, conn: Any, state: dict[str, Any], query: str
+    ) -> Any:
+        """Executor method for get_all_chunks_with_metadata query - runs in DB thread."""
+        return conn.fetch_sync(query)
